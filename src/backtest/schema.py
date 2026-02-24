@@ -1,0 +1,154 @@
+"""Backtest Schema Definitions (BT-01 to BT-04).
+
+Pydantic models for arbitrage opportunities and backtest reports.
+"""
+
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, Field, computed_field
+
+
+class ArbitrageOpportunity(BaseModel):
+    """A detected arbitrage opportunity at a specific point in time.
+    
+    Captures all relevant data for PnL calculation and analysis.
+    """
+    timestamp: datetime
+    position: tuple[int, int]  # (block_number, log_index)
+    cluster_id: str
+    market_prices: dict[str, float]  # market_id -> observed price
+    coherent_prices: dict[str, float]  # market_id -> arbitrage-free price
+    kl_divergence: float
+    constraints_violated: list[str]  # Descriptions of violated constraints
+    theoretical_profit: float  # Gross profit from the opportunity
+    net_profit: float = 0.0  # After transaction costs
+    trade_direction: dict[str, str] = Field(default_factory=dict)  # market_id -> "BUY"/"SELL"
+    
+    @computed_field
+    @property
+    def is_profitable_net(self) -> bool:
+        """Whether this opportunity is profitable after costs."""
+        return self.net_profit > 0
+    
+    @computed_field
+    @property
+    def price_adjustments(self) -> dict[str, float]:
+        """Price adjustments needed for each market."""
+        return {
+            mid: self.coherent_prices.get(mid, 0) - self.market_prices.get(mid, 0)
+            for mid in self.market_prices
+        }
+
+
+class ClusterPerformance(BaseModel):
+    """Performance metrics for a single cluster."""
+    cluster_id: str
+    theme: str
+    market_ids: list[str]
+    num_opportunities: int
+    gross_pnl: float
+    net_pnl: float
+    win_count: int  # Trades profitable after costs
+    loss_count: int
+    avg_kl_divergence: float
+    max_kl_divergence: float
+    
+    @computed_field
+    @property
+    def win_rate(self) -> float:
+        """Win rate for this cluster."""
+        total = self.win_count + self.loss_count
+        return self.win_count / total if total > 0 else 0.0
+
+
+class BacktestReport(BaseModel):
+    """Complete backtest results and statistics.
+    
+    Contains summary metrics and individual opportunities for detailed analysis.
+    """
+    # Time range
+    start_date: datetime
+    end_date: datetime
+    duration_hours: float = 0.0
+    
+    # Market coverage
+    markets_analyzed: int
+    clusters_found: int
+    
+    # Opportunity stats
+    total_opportunities: int
+    opportunities_per_hour: float = 0.0
+    
+    # PnL metrics
+    gross_pnl: float
+    net_pnl: float
+    transaction_costs: float
+    
+    # Win/loss stats
+    win_count: int = 0
+    loss_count: int = 0
+    win_rate: float = 0.0
+    
+    # KL divergence stats
+    avg_kl_divergence: float = 0.0
+    max_kl_divergence: float = 0.0
+    min_kl_divergence: float = 0.0
+    
+    # Risk metrics
+    max_drawdown: float = 0.0
+    sharpe_ratio: float = 0.0  # Placeholder for more sophisticated analysis
+    
+    # Best/worst trades
+    best_trade: Optional[ArbitrageOpportunity] = None
+    worst_trade: Optional[ArbitrageOpportunity] = None
+    
+    # Cluster-level breakdown
+    cluster_performance: list[ClusterPerformance] = Field(default_factory=list)
+    
+    # All opportunities (optional, can be large)
+    opportunities: list[ArbitrageOpportunity] = Field(default_factory=list)
+    
+    # Config used
+    kl_threshold: float = 0.01
+    transaction_cost_rate: float = 0.015
+    
+    class Config:
+        """Pydantic config."""
+        arbitrary_types_allowed = True
+
+
+class BacktestConfig(BaseModel):
+    """Configuration for running a backtest."""
+    market_ids: list[str]
+    start_block: Optional[int] = None
+    end_block: Optional[int] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    kl_threshold: float = 0.01  # Minimum KL divergence to flag opportunity
+    transaction_cost: float = 0.015  # 1.5% round-trip cost
+    min_profit: float = 0.001  # Minimum profit to record opportunity
+    progress_interval: int = 1000  # Print progress every N ticks
+    max_ticks: Optional[int] = None  # Stop after N ticks (for testing)
+    store_all_opportunities: bool = True  # Store full opportunity list in report
+
+
+class SimulationState(BaseModel):
+    """Internal state tracking during simulation."""
+    current_block: int = 0
+    current_log_index: int = 0
+    current_timestamp: Optional[datetime] = None
+    ticks_processed: int = 0
+    opportunities_found: int = 0
+    cumulative_pnl: float = 0.0
+    peak_pnl: float = 0.0
+    max_drawdown: float = 0.0
+    
+    def update_pnl(self, pnl: float) -> None:
+        """Update cumulative PnL and track drawdown."""
+        self.cumulative_pnl += pnl
+        if self.cumulative_pnl > self.peak_pnl:
+            self.peak_pnl = self.cumulative_pnl
+        
+        drawdown = self.peak_pnl - self.cumulative_pnl
+        if drawdown > self.max_drawdown:
+            self.max_drawdown = drawdown
