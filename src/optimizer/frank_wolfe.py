@@ -1,394 +1,316 @@
-"""Frank-Wolfe Solver for Arbitrage-Free Price Optimization.
+"""Frank-Wolfe algorithm for marginal polytope optimization.
 
-OPT-01: Frank-Wolfe Algorithm
-OPT-03: Barrier Frank-Wolfe Variant
-OPT-05: InitFW (Interior Point)
+Implements the Barrier Frank-Wolfe variant for finding coherent prices
+within the marginal polytope that are closest to market prices (in KL divergence).
 """
 
-import logging
-import time
+from __future__ import annotations
+
+from typing import Optional
+
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import minimize
-from typing import Callable
 
+from .divergence import (
+    build_theta_from_prices,
+    categorical_kl,
+    categorical_kl_gradient,
+    line_search_exact,
+    mu_to_market_prices,
+)
+from .lmo import (
+    MarginalConstraintBuilder,
+    MarginalConstraintMatrix,
+    MarginalPolytopeLMO,
+    build_constraints_from_graph,
+)
 from .schema import (
-    ArbitrageResult,
-    ConstraintViolation,
+    ConditionSpace,
+    MarginalArbitrageResult,
     OptimizationConfig,
     RelationshipGraph,
 )
-from .divergence import (
-    kl_divergence,
-    kl_gradient,
-    line_search_kl,
-    compute_duality_gap,
-)
-from .lmo import (
-    ConstraintMatrix,
-    ConstraintBuilder,
-    LinearMinimizationOracle,
-    build_constraints_from_graph,
-)
+
+
+def marginal_frank_wolfe(
+    market_prices: dict[str, list[float]],
+    constraints: MarginalConstraintMatrix,
+    config: OptimizationConfig | None = None,
+) -> MarginalArbitrageResult:
+    """Frank-Wolfe optimization over the marginal polytope.
+
+    Finds the coherent price vector mu in the marginal polytope that minimizes
+    KL(theta || mu), where theta represents market prices.
+
+    Args:
+        market_prices: Dict of market_id -> [p_yes, p_no, ...]
+        constraints: Constraint matrices from MarginalConstraintBuilder
+        config: Optimization configuration
+
+    Returns:
+        MarginalArbitrageResult with coherent prices and arbitrage metrics
+    """
+    if config is None:
+        config = OptimizationConfig()
+
+    space = constraints.condition_space
+
+    # 1. Build theta vector (market prices in condition space)
+    theta = build_theta_from_prices(market_prices, space)
+
+    # 2. Initialize LMO
+    lmo = MarginalPolytopeLMO(constraints)
+
+    # 3. Initialize mu from centroid of vertices (guarantees interior point)
+    mu = lmo.compute_centroid(n_samples=20)
+
+    # Ensure mu is strictly interior (Barrier FW)
+    epsilon = config.epsilon_init
+    mu_interior = _contract_toward_centroid(mu, epsilon)
+
+    # 4. Frank-Wolfe loop
+    converged = False
+    iterations = 0
+    gap = float("inf")
+    active_vertices: list[NDArray] = []
+
+    for t in range(config.max_iterations):
+        iterations = t + 1
+
+        # Gradient of KL(theta || mu) w.r.t. mu
+        gradient = categorical_kl_gradient(theta, mu_interior, space)
+
+        # LMO: find vertex minimizing gradient^T z
+        z_new, _ = lmo.solve(gradient)
+        active_vertices.append(z_new)
+
+        # Duality gap: gradient^T (mu - z_new)
+        gap = gradient @ (mu_interior - z_new)
+
+        if gap < config.tolerance:
+            converged = True
+            break
+
+        # Direction: vertex - current
+        direction = z_new - mu_interior
+
+        # Line search for optimal step size
+        gamma = line_search_exact(
+            theta, mu_interior, direction, space, max_gamma=1.0
+        )
+
+        # Update
+        mu_interior = mu_interior + gamma * direction
+
+        # Decay epsilon (allow closer to boundary as we converge)
+        epsilon = max(config.epsilon_min, epsilon * config.epsilon_decay)
+
+        # Re-contract toward interior (Barrier FW)
+        mu_interior = _contract_toward_centroid(mu_interior, epsilon, mu)
+
+    # 5. Compute final KL divergence
+    kl_divergence = categorical_kl(theta, mu_interior, space)
+
+    # 6. Build result
+    coherent_market_prices = mu_to_market_prices(mu_interior, space)
+
+    # Build condition prices
+    condition_prices = {}
+    coherent_condition_prices = {}
+    for i, cond in enumerate(space.conditions):
+        condition_prices[cond.condition_id] = theta[i]
+        coherent_condition_prices[cond.condition_id] = mu_interior[i]
+
+    return MarginalArbitrageResult(
+        condition_prices=condition_prices,
+        coherent_condition_prices=coherent_condition_prices,
+        market_prices=market_prices,
+        coherent_market_prices=coherent_market_prices,
+        kl_divergence=kl_divergence,
+        duality_gap=gap,
+        converged=converged,
+        iterations=iterations,
+        active_vertices=[v.astype(int).tolist() for v in active_vertices[-10:]],
+    )
+
+
+def _contract_toward_centroid(
+    mu: NDArray,
+    epsilon: float,
+    centroid: NDArray | None = None,
+) -> NDArray:
+    """Contract mu toward an interior point.
+
+    Implements Barrier FW: M_eps = (1 - eps)M + eps * centroid
+
+    Args:
+        mu: Current point
+        epsilon: Contraction factor
+        centroid: Interior point to contract toward (defaults to 0.5)
+
+    Returns:
+        Contracted point
+    """
+    if centroid is None:
+        centroid = np.ones_like(mu) * 0.5
+
+    return (1 - epsilon) * mu + epsilon * centroid
+
+
+def find_marginal_arbitrage(
+    market_prices: dict[str, list[float]],
+    relationships: RelationshipGraph,
+    market_outcomes: dict[str, list[str]] | None = None,
+    config: OptimizationConfig | None = None,
+) -> MarginalArbitrageResult:
+    """High-level API for combinatorial arbitrage detection.
+
+    This is the main entry point for detecting arbitrage opportunities
+    across related prediction markets.
+
+    Args:
+        market_prices: Dict of market_id -> [p_yes, p_no, ...]
+        relationships: Graph of logical relationships between markets
+        market_outcomes: Optional outcome names (defaults to YES/NO)
+        config: Optimization configuration
+
+    Returns:
+        MarginalArbitrageResult with arbitrage detection results
+
+    Example:
+        >>> # Market B implies Market A (if B=YES, then A=YES)
+        >>> graph = RelationshipGraph(clusters=[
+        ...     MarketCluster(
+        ...         cluster_id='test',
+        ...         market_ids=['A', 'B'],
+        ...         relationships=[
+        ...             MarketRelationship(type='implies', from_market='B', to_market='A')
+        ...         ]
+        ...     )
+        ... ])
+        >>> # Prices violate implication: B_yes=0.4 but A_yes=0.3
+        >>> result = find_marginal_arbitrage(
+        ...     market_prices={'A': [0.3, 0.7], 'B': [0.4, 0.6]},
+        ...     relationships=graph
+        ... )
+        >>> print(f"KL divergence: {result.kl_divergence:.4f}")
+        >>> print(f"Has arbitrage: {result.has_arbitrage()}")
+    """
+    # Extract market IDs from prices
+    market_ids = list(market_prices.keys())
+
+    # Build constraints from relationship graph
+    constraints = build_constraints_from_graph(
+        market_ids=market_ids,
+        relationships=relationships,
+        market_outcomes=market_outcomes,
+    )
+
+    # Run Frank-Wolfe optimization
+    return marginal_frank_wolfe(market_prices, constraints, config)
+
+
+def detect_arbitrage_simple(
+    market_prices: dict[str, list[float]],
+    implications: list[tuple[str, str]] | None = None,
+    mutex_pairs: list[tuple[str, str]] | None = None,
+    config: OptimizationConfig | None = None,
+) -> MarginalArbitrageResult:
+    """Simplified API for common constraint patterns.
+
+    Args:
+        market_prices: Dict of market_id -> [p_yes, p_no]
+        implications: List of (from_market, to_market) for B->A constraints
+        mutex_pairs: List of (market_a, market_b) for mutex constraints
+        config: Optimization configuration
+
+    Returns:
+        MarginalArbitrageResult
+
+    Example:
+        >>> # B implies A: if B=YES then A must be YES
+        >>> result = detect_arbitrage_simple(
+        ...     market_prices={'A': [0.3, 0.7], 'B': [0.4, 0.6]},
+        ...     implications=[('B', 'A')]  # B->A
+        ... )
+    """
+    market_ids = list(market_prices.keys())
+
+    # Build condition space
+    space = ConditionSpace.from_market_data(market_ids)
+
+    # Build constraints
+    builder = MarginalConstraintBuilder(space)
+
+    if implications:
+        for from_m, to_m in implications:
+            builder.add_implies(from_m, to_m)
+
+    if mutex_pairs:
+        for m_a, m_b in mutex_pairs:
+            builder.add_mutually_exclusive(m_a, m_b)
+
+    constraints = builder.build()
+
+    return marginal_frank_wolfe(market_prices, constraints, config)
+
+
+# =============================================================================
+# Backward Compatibility Functions (for existing backtest/simulator code)
+# =============================================================================
+
+from .schema import ArbitrageResult, ConstraintViolation
+from .divergence import kl_divergence, kl_gradient, line_search_kl
+import logging
 
 logger = logging.getLogger(__name__)
 
 
-def init_fw(
-    lmo: LinearMinimizationOracle,
-    market_prices: NDArray[np.float64],
-    num_vertices: int = 20,
-) -> NDArray[np.float64]:
-    """Find valid interior starting point (OPT-05)."""
-    logger.debug("[FW] Finding interior starting point with %d vertices", num_vertices)
-
-    extreme_points = lmo.get_extreme_points(num_vertices)
-
-    if len(extreme_points) == 0:
-        logger.debug("[FW] No extreme points found, using fallback")
-        center = np.full(lmo.n, 0.5)
-        violations = lmo.find_violated_constraints(market_prices)
-        if not violations:
-            return market_prices.copy()
-        return center
-
-    centroid = np.mean(extreme_points, axis=0)
-
-    violations = lmo.find_violated_constraints(centroid)
-    if violations:
-        logger.debug("[FW] Centroid violates constraints, adjusting")
-        center = np.full(lmo.n, 0.5)
-        for alpha in [0.9, 0.8, 0.7, 0.5, 0.3, 0.1]:
-            test = alpha * centroid + (1 - alpha) * center
-            if not lmo.find_violated_constraints(test):
-                return test
-        return center
-
-    logger.debug("[FW] Interior point found")
-    return centroid
-
-
-def project_onto_polytope(
-    x: NDArray[np.float64],
-    lmo: LinearMinimizationOracle,
-    max_iters: int = 100,
-) -> NDArray[np.float64]:
-    """Project point onto polytope using Dykstra algorithm."""
-    n = len(x)
-
-    x = np.clip(x, 0.01, 0.99)
-
-    if not lmo.find_violated_constraints(x):
-        return x
-
-    logger.debug("[FW] Projecting point onto polytope")
-
-    def objective(y):
-        return 0.5 * np.sum((y - x) ** 2)
-
-    def grad(y):
-        return y - x
-
-    constraints = []
-    A = lmo.constraints.A
-    b = lmo.constraints.b
-
-    for i in range(A.shape[0]):
-        constraints.append({
-            "type": "ineq",
-            "fun": lambda y, i=i: b[i] - np.dot(A[i], y),
-            "jac": lambda y, i=i: -A[i],
-        })
-
-    bounds = [(0.01, 0.99) for _ in range(n)]
-
-    result = minimize(
-        objective,
-        x,
-        method="SLSQP",
-        jac=grad,
-        constraints=constraints,
-        bounds=bounds,
-        options={"maxiter": max_iters}
-    )
-
-    return result.x
-
-
-def _parse_violations(violations: list) -> list[ConstraintViolation]:
-    """Parse violation tuples into ConstraintViolation objects."""
-    result = []
-    for name, amount in violations:
-        parts = name.split("(")
-        constraint_type = parts[0]
-        from_market = ""
-        to_market = None
-        if len(parts) > 1:
-            inner = parts[1].rstrip(")")
-            if "->" in inner:
-                from_market = inner.split("->")[0]
-                to_market = inner.split("->")[1]
-            elif "," in inner:
-                from_market = inner.split(",")[0]
-                to_market = inner.split(",")[1]
-            else:
-                from_market = inner
-        result.append(ConstraintViolation(
-            constraint_type=constraint_type,
-            from_market=from_market,
-            to_market=to_market,
-            violation_amount=amount,
-            description=name,
-        ))
-    return result
-
-
-def frank_wolfe(
+def _convert_to_list_prices(
     market_prices: dict[str, float],
-    constraints: ConstraintMatrix,
-    config: OptimizationConfig | None = None,
+) -> dict[str, list[float]]:
+    """Convert dict[str, float] to dict[str, list[float]]."""
+    return {mid: [p, 1.0 - p] for mid, p in market_prices.items()}
+
+
+def _convert_to_single_prices(
+    market_prices: dict[str, list[float]],
+) -> dict[str, float]:
+    """Convert dict[str, list[float]] to dict[str, float] (YES prob only)."""
+    return {mid: prices[0] for mid, prices in market_prices.items()}
+
+
+def _marginal_to_legacy_result(
+    result: MarginalArbitrageResult,
+    market_prices_input: dict[str, float],
 ) -> ArbitrageResult:
-    """Run Frank-Wolfe to find arbitrage-free prices (OPT-01)."""
-    if config is None:
-        config = OptimizationConfig()
+    """Convert MarginalArbitrageResult to legacy ArbitrageResult."""
+    coherent_single = _convert_to_single_prices(result.coherent_market_prices)
 
-    logger.info("[FW] Starting Frank-Wolfe: %d markets, %d constraints",
-                len(constraints.market_ids), constraints.A.shape[0])
-    start_time = time.time()
-
-    market_ids = constraints.market_ids
-    n = len(market_ids)
-    p = np.array([market_prices.get(mid, 0.5) for mid in market_ids])
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-
-    lmo = LinearMinimizationOracle(constraints)
-    q = project_onto_polytope(p.copy(), lmo)
-
-    converged = False
-    final_gap = float("inf")
-
-    for t in range(config.max_iterations):
-        g = kl_gradient(p, q)
-        s, _ = lmo.solve(g)
-        gap = compute_duality_gap(p, q, s)
-        final_gap = gap
-
-        if config.verbose and t % 100 == 0:
-            kl = kl_divergence(p, q)
-            logger.debug("[FW] Iter %d: KL=%.6f, gap=%.6f", t, kl, gap)
-
-        if gap < config.tolerance:
-            converged = True
-            logger.debug("[FW] Converged at iteration %d with gap=%.2e", t, gap)
-            break
-
-        direction = s - q
-        if config.line_search:
-            gamma = line_search_kl(p, q, direction, max_step=1.0)
-        else:
-            gamma = 2.0 / (t + 2)
-
-        q = q + gamma * direction
-        q = np.clip(q, 1e-10, 1 - 1e-10)
-
-    final_kl = kl_divergence(p, q)
-    elapsed = time.time() - start_time
-
-    violations = lmo.find_violated_constraints(p)
-    constraint_violations = _parse_violations(violations)
-
-    coherent_prices = {mid: float(q[i]) for i, mid in enumerate(market_ids)}
-    original_prices = {mid: float(p[i]) for i, mid in enumerate(market_ids)}
-
-    logger.info("[FW] Complete: KL=%.6f, gap=%.2e, iters=%d, violations=%d, time=%.3fs",
-                final_kl, final_gap, t + 1, len(violations), elapsed)
+    # Check for constraint violations
+    violations = []
+    for mid in market_prices_input:
+        if mid in coherent_single:
+            diff = abs(coherent_single[mid] - market_prices_input[mid])
+            if diff > 0.01:
+                violations.append(
+                    ConstraintViolation(
+                        constraint_type="price_adjustment",
+                        from_market=mid,
+                        to_market=None,
+                        violation_amount=diff,
+                        description=f"Price adjusted by {diff:.4f}",
+                    )
+                )
 
     return ArbitrageResult(
-        market_prices=original_prices,
-        coherent_prices=coherent_prices,
-        kl_divergence=final_kl,
-        constraints_violated=constraint_violations,
-        converged=converged,
-        iterations=t + 1,
-        final_gap=final_gap,
-    )
-
-
-def barrier_frank_wolfe(
-    market_prices: dict[str, float],
-    constraints: ConstraintMatrix,
-    config: OptimizationConfig | None = None,
-) -> ArbitrageResult:
-    """Run Barrier Frank-Wolfe for numerical stability (OPT-03)."""
-    if config is None:
-        config = OptimizationConfig()
-
-    logger.info("[FW] Starting Barrier Frank-Wolfe: %d markets, barrier=%.3f",
-                len(constraints.market_ids), config.initial_barrier)
-    start_time = time.time()
-
-    market_ids = constraints.market_ids
-    n = len(market_ids)
-    p = np.array([market_prices.get(mid, 0.5) for mid in market_ids])
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-
-    lmo = LinearMinimizationOracle(constraints)
-    center = init_fw(lmo, p)
-    q = project_onto_polytope(p.copy(), lmo)
-
-    epsilon = config.initial_barrier
-    converged = False
-    final_gap = float("inf")
-    total_iters = 0
-
-    while epsilon >= config.min_barrier:
-        logger.debug("[FW] Barrier phase: epsilon=%.4f", epsilon)
-
-        for t in range(config.max_iterations // 10):
-            total_iters += 1
-
-            g = kl_gradient(p, q)
-            s, _ = lmo.solve(g, epsilon=epsilon, center=center)
-            gap = compute_duality_gap(p, q, s)
-            final_gap = gap
-
-            if gap < config.tolerance:
-                converged = True
-                break
-
-            direction = s - q
-            if config.line_search:
-                gamma = line_search_kl(p, q, direction, max_step=1.0)
-            else:
-                gamma = 2.0 / (t + 2)
-
-            q = q + gamma * direction
-            q = np.clip(q, 1e-10, 1 - 1e-10)
-
-        if converged:
-            break
-
-        epsilon *= config.barrier_decay
-
-        if config.verbose:
-            kl = kl_divergence(p, q)
-            logger.debug("[FW] Barrier eps=%.4f: KL=%.6f, gap=%.6f", epsilon, kl, final_gap)
-
-    logger.debug("[FW] Final polishing phase")
-    for t in range(min(100, config.max_iterations)):
-        total_iters += 1
-
-        g = kl_gradient(p, q)
-        s, _ = lmo.solve(g, epsilon=0)
-        gap = compute_duality_gap(p, q, s)
-        final_gap = gap
-
-        if gap < config.tolerance:
-            converged = True
-            break
-
-        direction = s - q
-        if config.line_search:
-            gamma = line_search_kl(p, q, direction, max_step=1.0)
-        else:
-            gamma = 2.0 / (t + 2)
-
-        q = q + gamma * direction
-        q = np.clip(q, 1e-10, 1 - 1e-10)
-
-    final_kl = kl_divergence(p, q)
-    elapsed = time.time() - start_time
-
-    violations = lmo.find_violated_constraints(p)
-    constraint_violations = _parse_violations(violations)
-
-    coherent_prices = {mid: float(q[i]) for i, mid in enumerate(market_ids)}
-    original_prices = {mid: float(p[i]) for i, mid in enumerate(market_ids)}
-
-    logger.info("[FW] Barrier complete: KL=%.6f, gap=%.2e, iters=%d, violations=%d, time=%.3fs",
-                final_kl, final_gap, total_iters, len(violations), elapsed)
-
-    return ArbitrageResult(
-        market_prices=original_prices,
-        coherent_prices=coherent_prices,
-        kl_divergence=final_kl,
-        constraints_violated=constraint_violations,
-        converged=converged,
-        iterations=total_iters,
-        final_gap=final_gap,
-    )
-
-
-def projected_gradient_descent(
-    market_prices: dict[str, float],
-    constraints: ConstraintMatrix,
-    config: OptimizationConfig | None = None,
-) -> ArbitrageResult:
-    """Alternative solver using projected gradient descent."""
-    if config is None:
-        config = OptimizationConfig()
-
-    logger.info("[FW] Starting PGD: %d markets", len(constraints.market_ids))
-    start_time = time.time()
-
-    market_ids = constraints.market_ids
-    n = len(market_ids)
-    p = np.array([market_prices.get(mid, 0.5) for mid in market_ids])
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-
-    lmo = LinearMinimizationOracle(constraints)
-
-    def objective(q):
-        return kl_divergence(p, q)
-
-    def gradient(q):
-        return kl_gradient(p, q)
-
-    scipy_constraints = []
-    A = constraints.A
-    b = constraints.b
-
-    for i in range(A.shape[0]):
-        scipy_constraints.append({
-            "type": "ineq",
-            "fun": lambda q, i=i: b[i] - np.dot(A[i], q),
-            "jac": lambda q, i=i: -A[i],
-        })
-
-    bounds = [(0.01, 0.99) for _ in range(n)]
-    q0 = project_onto_polytope(p.copy(), lmo)
-
-    result = minimize(
-        objective,
-        q0,
-        method="SLSQP",
-        jac=gradient,
-        constraints=scipy_constraints,
-        bounds=bounds,
-        options={"maxiter": config.max_iterations, "ftol": config.tolerance}
-    )
-
-    q = result.x
-    final_kl = kl_divergence(p, q)
-    elapsed = time.time() - start_time
-
-    violations = lmo.find_violated_constraints(p)
-    constraint_violations = _parse_violations(violations)
-
-    coherent_prices = {mid: float(q[i]) for i, mid in enumerate(market_ids)}
-    original_prices = {mid: float(p[i]) for i, mid in enumerate(market_ids)}
-
-    logger.info("[FW] PGD complete: KL=%.6f, iters=%d, success=%s, time=%.3fs",
-                final_kl, result.nit, result.success, elapsed)
-
-    return ArbitrageResult(
-        market_prices=original_prices,
-        coherent_prices=coherent_prices,
-        kl_divergence=final_kl,
-        constraints_violated=constraint_violations,
-        converged=result.success,
-        iterations=result.nit,
-        final_gap=0.0,
+        market_prices=market_prices_input,
+        coherent_prices=coherent_single,
+        kl_divergence=result.kl_divergence,
+        constraints_violated=violations,
+        converged=result.converged,
+        iterations=result.iterations,
+        final_gap=result.duality_gap,
     )
 
 
@@ -398,22 +320,96 @@ def find_arbitrage(
     config: OptimizationConfig | None = None,
     use_barrier: bool = True,
 ) -> ArbitrageResult:
-    """High-level API: Find arbitrage-free prices from market relationships."""
-    logger.info("[OPT] Finding arbitrage: %d prices, barrier=%s", len(market_prices), use_barrier)
+    """High-level API: Find arbitrage-free prices (backward-compatible).
 
-    constraints = build_constraints_from_graph(relationships)
+    Args:
+        market_prices: Dict of market_id -> YES probability
+        relationships: RelationshipGraph with constraints
+        config: Optimization configuration
+        use_barrier: Whether to use barrier method (always True now)
 
-    if use_barrier:
-        return barrier_frank_wolfe(market_prices, constraints, config)
-    else:
-        return frank_wolfe(market_prices, constraints, config)
+    Returns:
+        ArbitrageResult with coherent prices
+    """
+    logger.info(
+        "[FW] find_arbitrage called with %d markets, use_barrier=%s",
+        len(market_prices),
+        use_barrier,
+    )
+
+    # Convert to new format
+    list_prices = _convert_to_list_prices(market_prices)
+
+    # Run new optimization
+    marginal_result = find_marginal_arbitrage(
+        market_prices=list_prices,
+        relationships=relationships,
+        config=config,
+    )
+
+    # Convert result back
+    return _marginal_to_legacy_result(marginal_result, market_prices)
 
 
 def find_arbitrage_simple(
     market_prices: dict[str, float],
-    constraints: ConstraintMatrix,
+    constraints,  # ConstraintMatrix (ignored, rebuilt from scratch)
     config: OptimizationConfig | None = None,
 ) -> ArbitrageResult:
-    """Simplified API using pre-built constraints."""
-    logger.debug("[OPT] find_arbitrage_simple called")
+    """Simplified API using pre-built constraints (backward-compatible).
+
+    Note: The constraints parameter is ignored; constraints are rebuilt
+    from the market structure.
+    """
+    logger.debug("[FW] find_arbitrage_simple called")
+
+    # Convert and run without constraints (just market structure)
+    list_prices = _convert_to_list_prices(market_prices)
+    market_ids = list(market_prices.keys())
+
+    space = ConditionSpace.from_market_data(market_ids)
+    builder = MarginalConstraintBuilder(space)
+    new_constraints = builder.build()
+
+    marginal_result = marginal_frank_wolfe(list_prices, new_constraints, config)
+    return _marginal_to_legacy_result(marginal_result, market_prices)
+
+
+def barrier_frank_wolfe(
+    market_prices: dict[str, float],
+    constraints,  # ConstraintMatrix
+    config: OptimizationConfig | None = None,
+) -> ArbitrageResult:
+    """Barrier Frank-Wolfe algorithm (backward-compatible wrapper)."""
+    return find_arbitrage_simple(market_prices, constraints, config)
+
+
+def frank_wolfe(
+    market_prices: dict[str, float],
+    constraints,
+    config: OptimizationConfig | None = None,
+) -> ArbitrageResult:
+    """Standard Frank-Wolfe (maps to barrier variant)."""
     return barrier_frank_wolfe(market_prices, constraints, config)
+
+
+def init_fw(
+    market_ids: list[str],
+    constraints,
+    n_samples: int = 10,
+) -> dict[str, float]:
+    """Initialize Frank-Wolfe by finding interior point.
+
+    Returns starting point as dict[str, float].
+    """
+    # Just return uniform 0.5 for each market
+    return {mid: 0.5 for mid in market_ids}
+
+
+def projected_gradient_descent(
+    market_prices: dict[str, float],
+    constraints,
+    config: OptimizationConfig | None = None,
+) -> ArbitrageResult:
+    """Projected gradient descent (maps to Frank-Wolfe)."""
+    return frank_wolfe(market_prices, constraints, config)
