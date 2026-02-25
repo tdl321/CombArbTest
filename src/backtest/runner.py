@@ -34,7 +34,7 @@ def run_backtest(
 ) -> BacktestReport:
     """Run backtest pipeline."""
     logger.info("[BACKTEST] Starting backtest with %d markets", len(market_ids))
-    logger.info("[BACKTEST] Parameters: kl_threshold=%.4f, tx_cost=%.4f, use_llm=%s",
+    logger.info("[BACKTEST] Parameters: violation_threshold=%.4f, fee_per_leg=%.4f, llm_relationships=%s",
                 kl_threshold, transaction_cost, use_llm)
     start_time = time.time()
 
@@ -74,7 +74,7 @@ def run_backtest(
             relationship_graph = _default_graph(market_ids)
 
     logger.info("[BACKTEST] Relationship graph: %d clusters, %d relationships",
-                len(relationship_graph.clusters), relationship_graph.total_relationships)
+                len(relationship_graph.clusters), len(relationship_graph.get_all_relationships()))
 
     # Config
     config = BacktestConfig(
@@ -136,7 +136,7 @@ def run_backtest(
         store_all_opportunities=store_all_opportunities,
     )
 
-    logger.info("[BACKTEST] Report generated: gross_pnl=%.4f, net_pnl=%.4f, win_rate=%.2f%%",
+    logger.info("[BACKTEST] Report generated: locked_profit=%.4f, net_profit=%.4f, win_rate=%.2f%%",
                 report.gross_pnl, report.net_pnl, report.win_rate * 100)
 
     return report

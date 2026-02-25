@@ -375,3 +375,117 @@ if __name__ == "__main__":
     # Run tests
     print("\n\nRunning unit tests...")
     pytest.main([__file__, "-v"])
+
+
+class TestIntegerProgramming:
+    """Test OPT-02 Extension: Integer Programming in LMO."""
+    
+    def test_binary_mode(self):
+        """Test binary IP produces 0/1 solutions."""
+        builder = ConstraintBuilder(["A", "B", "C"])
+        # Sum >= 1 (at least one must be selected)
+        builder._constraints.append((np.array([-1.0, -1.0, -1.0]), -1.0, 'sum_lb'))
+        # Sum <= 1 (at most one can be selected - makes it partition)
+        builder._constraints.append((np.array([1.0, 1.0, 1.0]), 1.0, 'sum_ub'))
+        constraints = builder.build()
+        
+        lmo = LinearMinimizationOracle(constraints, mode="binary")
+        
+        # Gradient favoring A
+        g = np.array([-1.0, 0.0, 0.5])
+        x, _ = lmo.solve(g)
+        
+        # All values should be 0 or 1
+        assert all(v in [0.0, 1.0] for v in x), f"Non-binary solution: {x}"
+        # Should select A (lowest cost)
+        assert x[0] == 1.0
+        assert x[1] == 0.0
+        assert x[2] == 0.0
+    
+    def test_integer_mode_discrete_units(self):
+        """Test integer IP produces discrete solutions."""
+        builder = ConstraintBuilder(["A", "B"])
+        # Sum = 1
+        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
+        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
+        constraints = builder.build()
+        
+        discrete_unit = 0.1
+        lmo = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=discrete_unit)
+        
+        g = np.array([-0.7, 0.3])  # Favor A but not completely
+        x, _ = lmo.solve(g)
+        
+        # All values should be multiples of 0.1
+        for v in x:
+            assert abs(v / discrete_unit - round(v / discrete_unit)) < 1e-6, \
+                f"Value {v} is not a multiple of {discrete_unit}"
+        
+        # Sum should equal 1
+        assert abs(sum(x) - 1.0) < 1e-6
+    
+    def test_solve_discrete_convenience_method(self):
+        """Test solve_discrete temporarily changes mode."""
+        builder = ConstraintBuilder(["A", "B"])
+        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
+        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
+        constraints = builder.build()
+        
+        lmo = LinearMinimizationOracle(constraints)  # Default continuous
+        assert lmo.mode == "continuous"
+        
+        g = np.array([-1.0, 0.0])
+        
+        # Continuous solution
+        x_cont, _ = lmo.solve(g)
+        
+        # Discrete solution via convenience method
+        x_discrete, _ = lmo.solve_discrete(g, mode="binary")
+        
+        # Mode should be restored
+        assert lmo.mode == "continuous"
+        
+        # Binary solution should be 0/1
+        assert all(v in [0.0, 1.0] for v in x_discrete)
+    
+    def test_integer_fallback_to_lp(self):
+        """Test that infeasible integer problems fall back to LP."""
+        builder = ConstraintBuilder(["A"])
+        # Constraint that makes integer infeasible: x = 0.5 exactly
+        builder._constraints.append((np.array([1.0]), 0.5, 'eq_ub'))
+        builder._constraints.append((np.array([-1.0]), -0.5, 'eq_lb'))
+        constraints = builder.build()
+        
+        lmo = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=1.0)
+        
+        g = np.array([1.0])
+        x, _ = lmo.solve(g)  # Should fall back gracefully
+        
+        # Should return a valid solution (fallback)
+        assert len(x) == 1
+    
+    def test_integer_vs_continuous_difference(self):
+        """Test that integer and continuous can produce different results."""
+        builder = ConstraintBuilder(["A", "B"])
+        # Sum = 1
+        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
+        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
+        # A <= 0.7
+        builder._constraints.append((np.array([1.0, 0.0]), 0.7, 'a_ub'))
+        constraints = builder.build()
+        
+        g = np.array([-1.0, 0.0])  # Minimize -A, i.e., maximize A
+        
+        # Continuous: A should be 0.7 (hits constraint)
+        lmo_cont = LinearMinimizationOracle(constraints, mode="continuous")
+        x_cont, _ = lmo_cont.solve(g)
+        
+        # Integer with unit 0.5: A should be 0.5 (largest multiple of 0.5 <= 0.7)
+        lmo_int = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=0.5)
+        x_int, _ = lmo_int.solve(g)
+        
+        # Verify continuous is 0.7
+        assert abs(x_cont[0] - 0.7) < 1e-6, f"Continuous A = {x_cont[0]}, expected 0.7"
+        
+        # Verify integer is 0.5 (largest discrete value <= 0.7)
+        assert abs(x_int[0] - 0.5) < 1e-6, f"Integer A = {x_int[0]}, expected 0.5"

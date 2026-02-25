@@ -2,10 +2,26 @@
 
 OPT-05 Output Contract: Defines the ArbitrageResult model that captures
 the output of the Frank-Wolfe solver.
+
+NOTE: This schema is designed to be COMPATIBLE with src/llm/schema.py.
+The LLM schema has additional fields (theme, reasoning, metadata) that
+are optional here for minimal optimizer usage.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
+
+
+# Relationship types - MUST match src/llm/schema.py RelationshipType enum
+RELATIONSHIP_TYPES = Literal[
+    "implies",
+    "mutually_exclusive", 
+    "and",
+    "or",
+    "prerequisite",
+    "exhaustive",
+    "incompatible"  # Added for compatibility with LLM schema
+]
 
 
 class MarketRelationship(BaseModel):
@@ -13,29 +29,42 @@ class MarketRelationship(BaseModel):
     
     This is the INPUT from the LLM agent that identifies logical
     relationships between markets.
+    
+    Compatible with src/llm/schema.MarketRelationship (LLM schema adds 'reasoning').
     """
-    type: Literal["implies", "mutually_exclusive", "and", "or", "prerequisite"]
+    type: RELATIONSHIP_TYPES
     from_market: str
-    to_market: str | None = None  # None for unary constraints
+    to_market: str | None = None  # None for unary constraints (e.g., exhaustive)
     confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str | None = None  # Optional: LLM explanation (present in llm/schema.py)
 
 
 class MarketCluster(BaseModel):
     """A cluster of related markets.
     
     Contains market IDs and the relationships between them.
+    
+    Compatible with src/llm/schema.MarketCluster (LLM schema adds 'theme').
     """
     cluster_id: str
     market_ids: list[str]
-    relationships: list[MarketRelationship]
+    relationships: list[MarketRelationship] = Field(default_factory=list)
+    is_partition: bool = False  # If True, all markets must sum to 1
+    theme: str | None = None  # Optional: cluster description (present in llm/schema.py)
 
 
 class RelationshipGraph(BaseModel):
     """Full graph of market relationships.
     
     This is the complete INPUT from the LLM agent.
+    
+    Compatible with src/llm/schema.RelationshipGraph (LLM schema adds metadata).
     """
     clusters: list[MarketCluster]
+    # Optional metadata fields (present in llm/schema.py)
+    model_used: str | None = None
+    total_markets: int = 0
+    total_relationships: int = 0
     
     def get_all_market_ids(self) -> set[str]:
         """Get all unique market IDs across clusters."""

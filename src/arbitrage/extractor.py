@@ -141,7 +141,7 @@ class ArbitrageExtractor:
             return self._handle_implies_violation(violation, market_prices)
         elif "mutex" in ctype:
             return self._handle_mutex_violation(violation, market_prices)
-        elif "partition" in ctype:
+        elif "partition" in ctype or "exhaustive" in ctype:
             return self._handle_partition_violation(violation, market_prices)
         else:
             logger.warning("[ARB] Unknown constraint type: %s", ctype)

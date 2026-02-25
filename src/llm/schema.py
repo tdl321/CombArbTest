@@ -9,6 +9,9 @@ Implements formal logical constraints for combinatorial arbitrage:
 - Logical Implication: Truth of A requires truth of B (P(A) ≤ P(B))
 - Prerequisite: Temporal/causal dependency
 - Incompatibility: Outcomes cannot coexist (P(A ∧ B) = 0)
+
+NOTE: This schema is the CANONICAL source. The optimizer schema
+(src/optimizer/schema.py) is a compatible subset for minimal usage.
 """
 
 from datetime import datetime
@@ -133,6 +136,7 @@ class MarketCluster(BaseModel):
     theme: str  # e.g., "2024 US Presidential Election"
     market_ids: list[str]  # List of market IDs in this cluster
     relationships: list[MarketRelationship] = Field(default_factory=list)
+    is_partition: bool = False  # If True, all markets must sum to 1
 
     @property
     def size(self) -> int:
@@ -201,6 +205,16 @@ class RelationshipGraph(BaseModel):
             "total_relationships",
             sum(len(c.relationships) for c in self.clusters)
         )
+
+    def get_all_market_ids(self) -> set[str]:
+        """Get all unique market IDs across clusters.
+        
+        Added for compatibility with optimizer schema interface.
+        """
+        ids = set()
+        for cluster in self.clusters:
+            ids.update(cluster.market_ids)
+        return ids
 
     def get_cluster_for_market(self, market_id: str) -> MarketCluster | None:
         """Find the cluster containing a specific market."""

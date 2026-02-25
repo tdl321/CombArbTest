@@ -37,6 +37,7 @@ class MockCluster:
     theme: str
     market_ids: list[str]
     relationships: list[MockRelationship]
+    is_partition: bool = False
 
 
 # =============================================================================
@@ -192,6 +193,18 @@ class TestIsPartitionConstraint:
             relationships=[],
         )
         assert is_partition_constraint(cluster) is False
+
+    def test_is_partition_flag_fast_path(self):
+        """is_partition=True flag bypasses relationship checks."""
+        # Cluster with is_partition=True but NO exhaustive/exclusive relationships
+        cluster = MockCluster(
+            cluster_id="test",
+            theme="Test",
+            market_ids=["A", "B", "C"],
+            relationships=[],  # No relationships!
+            is_partition=True,  # But flag is set
+        )
+        assert is_partition_constraint(cluster) is True
 
 
 # =============================================================================

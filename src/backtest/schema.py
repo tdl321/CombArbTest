@@ -57,7 +57,7 @@ class ArbitrageOpportunity(BaseModel):
     @computed_field
     @property
     def theoretical_profit(self) -> float:
-        """Alias for locked_profit (deprecated, use locked_profit)."""
+        """DEPRECATED: Alias for locked_profit. Use locked_profit instead."""
         return self.trade.locked_profit
     
     def net_profit(self, fee_per_leg: float = 0.01) -> float:
@@ -105,7 +105,7 @@ class ClusterPerformance(BaseModel):
     net_pnl: float
     win_count: int  # Trades profitable after costs
     loss_count: int
-    avg_kl_divergence: float
+    avg_kl_divergence: float  # Actually violation_amount (legacy field name)
     max_kl_divergence: float
     
     @computed_field
@@ -123,7 +123,7 @@ class BacktestConfig(BaseModel):
     end_block: Optional[int] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
-    kl_threshold: float = 0.01  # Minimum KL divergence to flag opportunity
+    kl_threshold: float = 0.01  # Minimum violation amount to flag opportunity
     transaction_cost: float = 0.015  # 1.5% round-trip cost
     min_profit: float = 0.001  # Minimum profit to record opportunity
     progress_interval: int = 1000  # Print progress every N ticks
@@ -171,7 +171,7 @@ class BacktestReport(BaseModel):
     loss_count: int = 0
     win_rate: float = 0.0
     
-    # KL divergence stats
+    # Violation stats (legacy field names use kl_divergence)
     avg_kl_divergence: float = 0.0
     max_kl_divergence: float = 0.0
     min_kl_divergence: float = 0.0

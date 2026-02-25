@@ -71,7 +71,7 @@ def generate_report(
         cluster_market_ids=cluster_market_ids,
     )
 
-    logger.info("[REPORT] Report metrics: gross_pnl=%.4f, net_pnl=%.4f, win_rate=%.2f%%, max_dd=%.4f",
+    logger.info("[REPORT] Report metrics: locked_profit=%.4f, net_profit=%.4f, win_rate=%.2f%%, max_dd=%.4f",
                 gross_pnl, net_pnl, win_rate * 100, max_drawdown)
 
     return BacktestReport(
@@ -194,7 +194,7 @@ def format_report(report: BacktestReport) -> str:
         "",
         "PnL Summary (per $1 stake per market)",
         "-" * 40,
-        "  Gross PnL:          $%.4f" % report.gross_pnl,
+        "  Locked Profit:      $%.4f" % report.gross_pnl,  # Profit before fees
         "  Transaction Costs:  $%.4f" % report.transaction_costs,
         "  Net PnL:            $%.4f" % report.net_pnl,
         "",
@@ -204,7 +204,7 @@ def format_report(report: BacktestReport) -> str:
         "  Losses:     %d" % report.loss_count,
         "  Win Rate:   %.1f%%" % (report.win_rate * 100),
         "",
-        "KL Divergence Statistics",
+        "Violation Statistics",
         "-" * 40,
         "  Average:  %.6f" % report.avg_kl_divergence,
         "  Maximum:  %.6f" % report.max_kl_divergence,
@@ -222,7 +222,7 @@ def format_report(report: BacktestReport) -> str:
             "-" * 40,
             "  Cluster:    %s" % report.best_trade.cluster_id,
             "  Net Profit: $%.4f" % report.best_trade.net_profit(),
-            "  KL Div:     %.6f" % report.best_trade.trade.violation_amount,
+            "  Edge:       %.6f" % report.best_trade.trade.violation_amount,
             "  Time:       %s" % report.best_trade.timestamp.isoformat(),
         ])
 
@@ -233,7 +233,7 @@ def format_report(report: BacktestReport) -> str:
             "-" * 40,
             "  Cluster:    %s" % report.worst_trade.cluster_id,
             "  Net Profit: $%.4f" % report.worst_trade.net_profit(),
-            "  KL Div:     %.6f" % report.worst_trade.trade.violation_amount,
+            "  Edge:       %.6f" % report.worst_trade.trade.violation_amount,
             "  Time:       %s" % report.worst_trade.timestamp.isoformat(),
         ])
 

@@ -5,10 +5,15 @@ prices given market relationships identified by the LLM.
 
 Components:
 - OPT-01: Frank-Wolfe solver (frank_wolfe.py)
-- OPT-02: Linear Minimization Oracle with HiGHS (lmo.py)
+- OPT-02: Linear Minimization Oracle with HiGHS/MILP (lmo.py)
 - OPT-03: Barrier Frank-Wolfe variant (frank_wolfe.py)
 - OPT-04: KL Divergence calculations (divergence.py)
 - OPT-05: InitFW interior point finder (frank_wolfe.py)
+
+The LMO supports three solver modes:
+- "continuous": Standard LP (HiGHS) - default, for Frank-Wolfe optimization
+- "integer": Integer LP (scipy MILP) - for discrete position quantities
+- "binary": Binary IP (scipy MILP) - for 0/1 decisions
 
 Usage:
     from src.optimizer import find_arbitrage, ArbitrageResult
@@ -33,6 +38,13 @@ Usage:
     
     print(f"Arbitrage detected: {result.has_arbitrage}")
     print(f"Coherent prices: {result.coherent_prices}")
+    
+    # For discrete trade execution, use integer mode:
+    from src.optimizer import LinearMinimizationOracle, build_constraints_from_graph
+    
+    constraints = build_constraints_from_graph(graph)
+    lmo = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=0.01)
+    x_discrete, obj = lmo.solve(gradient)
 """
 
 from .schema import (
@@ -56,6 +68,7 @@ from .lmo import (
     ConstraintBuilder,
     LinearMinimizationOracle,
     build_constraints_from_graph,
+    SolverMode,
 )
 
 from .frank_wolfe import (
@@ -85,6 +98,7 @@ __all__ = [
     "ConstraintBuilder",
     "LinearMinimizationOracle",
     "build_constraints_from_graph",
+    "SolverMode",
     # Frank-Wolfe
     "init_fw",
     "frank_wolfe",

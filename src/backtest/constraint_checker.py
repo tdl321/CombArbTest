@@ -116,8 +116,8 @@ def is_partition_constraint(cluster) -> bool:
     
     A partition requires:
     1. At least 3 markets (for combinatorial arbitrage)
-    2. At least one exhaustive relationship
-    3. Most pairs being mutually exclusive
+    2. Either is_partition=True flag, OR
+    3. At least one exhaustive relationship with mutual exclusivity
     
     Args:
         cluster: MarketCluster from src.llm.schema or src.optimizer.schema
@@ -129,6 +129,12 @@ def is_partition_constraint(cluster) -> bool:
     if len(cluster.market_ids) < 3:
         return False
     
+    # Fast path: check is_partition flag first
+    if hasattr(cluster, "is_partition") and cluster.is_partition:
+        logger.debug("[PARTITION] Cluster %s: is_partition=True flag set", cluster.cluster_id)
+        return True
+    
+    # Fallback: check for exhaustive relationship in relationships list
     if not hasattr(cluster, 'relationships') or not cluster.relationships:
         return False
     
