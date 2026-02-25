@@ -1,13 +1,6 @@
-"""LLM integration for market analysis.
+"""LLM integration for market analysis."""
 
-Modules:
-- client: LLMClient for OpenRouter API (Kimi 2.5)
-- schema: Pydantic models for clustering and relationships
-- clustering: Semantic market clustering
-- extractor: Relationship extraction between markets
-"""
-
-from .client import LLMClient, get_client
+from .client import LLMClient, get_client, extract_json_from_response
 from .schema import (
     MarketCluster,
     MarketInfo,
@@ -15,28 +8,22 @@ from .schema import (
     RelationshipGraph,
     RelationshipType,
 )
-from .clustering import MarketClusterer, cluster_markets
-from .extractor import (
-    RelationshipExtractor,
+from .clustering import (
+    MarketClusterer,
+    cluster_markets,
     build_relationship_graph,
-    extract_relationships,
 )
 
 __all__ = [
-    # Client
     "LLMClient",
     "get_client",
-    # Schema
+    "extract_json_from_response",
     "MarketCluster",
-    "MarketInfo", 
+    "MarketInfo",
     "MarketRelationship",
     "RelationshipGraph",
     "RelationshipType",
-    # Clustering
     "MarketClusterer",
     "cluster_markets",
-    # Extraction
-    "RelationshipExtractor",
     "build_relationship_graph",
-    "extract_relationships",
 ]

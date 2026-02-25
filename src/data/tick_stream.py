@@ -2,13 +2,10 @@
 
 This module provides tick-level (trade-by-trade) data access that preserves
 the precise ordering needed for cross-market arbitrage detection.
-
-Key concepts:
-- TickStream: Iterator over trades with (block_number, log_index) ordering
-- MarketStateSnapshot: Point-in-time state of a market (best bid/ask implied)
-- CrossMarketIterator: Synchronized iteration across multiple markets
 """
 
+import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -18,42 +15,37 @@ import polars as pl
 
 from .loader import BlockLoader, MarketLoader, TradeLoader
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class TickPosition:
-    """Unique position in the tick stream.
-    
-    (block_number, log_index) provides deterministic ordering.
-    All trades at the same position happened atomically (same tx or same block instant).
-    """
+    """Unique position in the tick stream."""
     block_number: int
     log_index: int
     
-    def __lt__(self, other: 'TickPosition') -> bool:
+    def __lt__(self, other: "TickPosition") -> bool:
         if self.block_number != other.block_number:
             return self.block_number < other.block_number
         return self.log_index < other.log_index
     
-    def __le__(self, other: 'TickPosition') -> bool:
+    def __le__(self, other: "TickPosition") -> bool:
         return self == other or self < other
 
 
 @dataclass(frozen=True, slots=True)
 class Tick:
-    """A single trade event with computed price.
-    
-    Preserves raw data while adding computed fields for analysis.
-    """
+    """A single trade event with computed price."""
     position: TickPosition
     transaction_hash: str
-    token_id: str  # The outcome token being traded
-    side: str  # 'BUY' or 'SELL' (from taker's perspective)
-    price: Decimal  # USDC per outcome token
-    size: Decimal  # Tokens traded
-    usdc_volume: Decimal  # USDC exchanged
+    token_id: str
+    side: str
+    price: Decimal
+    size: Decimal
+    usdc_volume: Decimal
     maker: str
     taker: str
-    timestamp: datetime | None = None  # Joined from blocks table
+    timestamp: datetime | None = None
     
     @property
     def block_number(self) -> int:
@@ -66,64 +58,43 @@ class Tick:
 
 @dataclass
 class MarketStateSnapshot:
-    """Point-in-time state of a market derived from recent trades.
-    
-    For arbitrage detection, we care about:
-    - Last traded price (most recent signal)
-    - Price direction (momentum)
-    - Time since last trade (staleness)
-    """
+    """Point-in-time state of a market derived from recent trades."""
     market_id: str
     token_id: str
     outcome_index: int
     position: TickPosition
     timestamp: datetime | None
-    
-    # Derived from recent trades
     last_price: Decimal | None = None
-    prev_price: Decimal | None = None  # For momentum calculation
-    trade_count_window: int = 0  # Trades in lookback window
+    prev_price: Decimal | None = None
+    trade_count_window: int = 0
     
     @property
     def price_change(self) -> Decimal | None:
-        """Price change from previous trade."""
         if self.last_price is None or self.prev_price is None:
             return None
         return self.last_price - self.prev_price
     
     @property
     def is_stale(self) -> bool:
-        """Whether this state is based on old data (no recent trades)."""
         return self.trade_count_window == 0
 
 
 @dataclass
 class CrossMarketSnapshot:
-    """Synchronized snapshot of multiple related markets at a tick position.
-    
-    Used for detecting arbitrage opportunities across markets.
-    """
+    """Synchronized snapshot of multiple related markets at a tick position."""
     position: TickPosition
     timestamp: datetime | None
-    states: dict[str, MarketStateSnapshot]  # market_id -> state
+    states: dict[str, MarketStateSnapshot]
     
     def get_prices(self) -> dict[str, Decimal | None]:
-        """Get last traded prices for all markets."""
         return {mid: state.last_price for mid, state in self.states.items()}
     
     def has_all_prices(self) -> bool:
-        """Check if all markets have valid prices."""
         return all(state.last_price is not None for state in self.states.values())
 
 
 class TickStream:
-    """Iterator over trades for a market, maintaining block/log ordering.
-    
-    Usage:
-        stream = TickStream(trade_loader, block_loader, market)
-        for tick in stream.iter_ticks(start_block, end_block):
-            print(f"{tick.position}: {tick.price}")
-    """
+    """Iterator over trades for a market, maintaining block/log ordering."""
     
     def __init__(
         self,
@@ -139,6 +110,7 @@ class TickStream:
         self.token_ids = token_ids
         self.target_token_id = token_ids[outcome_index]
         self.outcome_index = outcome_index
+        logger.debug("[DATA] TickStream initialized for market %s, token %s", market_id, self.target_token_id)
     
     def iter_ticks(
         self,
@@ -146,14 +118,12 @@ class TickStream:
         end_block: int | None = None,
         batch_size: int = 10000,
     ) -> Iterator[Tick]:
-        """Iterate over ticks in (block, log_index) order.
-        
-        Yields ticks lazily in batches to manage memory.
-        """
+        """Iterate over ticks in (block, log_index) order."""
+        logger.info("[DATA] Starting tick iteration: start_block=%s, end_block=%s", start_block, end_block)
+        tick_count = 0
         current_block = start_block
         
         while True:
-            # Fetch batch of trades
             trades_df = self.trade_loader.query_trades(
                 asset_ids=[self.target_token_id],
                 min_block=current_block,
@@ -164,96 +134,72 @@ class TickStream:
             if trades_df.is_empty():
                 break
             
-            # Enrich with timestamps
             trades_df = self.trade_loader.enrich_with_timestamps(trades_df)
+            trades_df = trades_df.sort(["block_number", "log_index"])
             
-            # Sort by position
-            trades_df = trades_df.sort(['block_number', 'log_index'])
-            
-            # Convert to ticks
             for row in trades_df.iter_rows(named=True):
                 tick = self._row_to_tick(row)
                 if tick is not None:
+                    tick_count += 1
                     yield tick
             
-            # Move to next batch
-            last_block = trades_df['block_number'].max()
+            last_block = trades_df["block_number"].max()
             if last_block == current_block:
-                # All trades in this batch are from same block, need to handle pagination
-                # This is a simplification - real impl would track log_index too
                 break
             current_block = last_block
             
-            # Check if we've reached the end
             if end_block is not None and current_block >= end_block:
                 break
+        
+        logger.info("[DATA] Tick iteration complete: %d ticks yielded", tick_count)
     
     def _row_to_tick(self, row: dict) -> Tick | None:
         """Convert a trade row to a Tick."""
-        maker_asset = str(row['maker_asset_id'])
-        taker_asset = str(row['taker_asset_id'])
-        maker_amount = Decimal(row['maker_amount']) / Decimal(1_000_000)
-        taker_amount = Decimal(row['taker_amount']) / Decimal(1_000_000)
+        maker_asset = str(row["maker_asset_id"])
+        taker_asset = str(row["taker_asset_id"])
+        maker_amount = Decimal(row["maker_amount"]) / Decimal(1_000_000)
+        taker_amount = Decimal(row["taker_amount"]) / Decimal(1_000_000)
         
-        # Determine side and price
-        # maker_asset_id == '0' means maker provides USDC (taker is buying tokens)
-        # taker_asset_id == '0' means taker provides USDC (taker is selling tokens)
-        if maker_asset == '0':
-            # Taker buys tokens: pays USDC, receives tokens
-            side = 'BUY'
+        if maker_asset == "0":
+            side = "BUY"
             price = maker_amount / taker_amount if taker_amount > 0 else None
             size = taker_amount
             usdc_volume = maker_amount
             token_id = taker_asset
-        elif taker_asset == '0':
-            # Taker sells tokens: provides tokens, receives USDC
-            side = 'SELL'
+        elif taker_asset == "0":
+            side = "SELL"
             price = taker_amount / maker_amount if maker_amount > 0 else None
             size = maker_amount
             usdc_volume = taker_amount
             token_id = maker_asset
         else:
-            # Token-to-token trade (rare) - skip for now
             return None
         
         if price is None:
             return None
         
-        # Filter to target token
         if token_id != self.target_token_id:
             return None
         
         return Tick(
             position=TickPosition(
-                block_number=row['block_number'],
-                log_index=row['log_index'],
+                block_number=row["block_number"],
+                log_index=row["log_index"],
             ),
-            transaction_hash=row['transaction_hash'],
+            transaction_hash=row["transaction_hash"],
             token_id=token_id,
             side=side,
             price=price,
             size=size,
             usdc_volume=usdc_volume,
-            maker=row['maker'],
-            taker=row['taker'],
-            timestamp=row.get('block_timestamp'),
+            maker=row["maker"],
+            taker=row["taker"],
+            timestamp=row.get("block_timestamp"),
         )
 
 
 class CrossMarketIterator:
-    """Synchronized iteration across multiple markets for arbitrage detection.
-    
-    This is the key class for arbitrage detection. It maintains state for
-    multiple markets and yields snapshots at each tick position where
-    any market has activity.
-    
-    Usage:
-        iterator = CrossMarketIterator(trade_loader, block_loader, markets)
-        for snapshot in iterator.iter_snapshots(start_block, end_block):
-            if snapshot.has_all_prices():
-                prices = snapshot.get_prices()
-                # Check for arbitrage...
-    """
+    """Synchronized iteration across multiple markets for arbitrage detection."""
     
     def __init__(
         self,
@@ -261,7 +207,7 @@ class CrossMarketIterator:
         block_loader: BlockLoader,
         market_loader: MarketLoader,
         market_ids: list[str],
-        outcome_indices: dict[str, int] | None = None,  # market_id -> outcome_index
+        outcome_indices: dict[str, int] | None = None,
     ):
         self.trade_loader = trade_loader
         self.block_loader = block_loader
@@ -269,20 +215,22 @@ class CrossMarketIterator:
         self.market_ids = market_ids
         self.outcome_indices = outcome_indices or {mid: 0 for mid in market_ids}
         
-        # Initialize streams
         self._streams: dict[str, TickStream] = {}
-        self._token_ids: dict[str, str] = {}  # market_id -> target_token_id
+        self._token_ids: dict[str, str] = {}
         self._init_streams()
+        logger.info("[DATA] CrossMarketIterator initialized with %d markets", len(market_ids))
     
     def _init_streams(self) -> None:
         """Initialize tick streams for each market."""
         for market_id in self.market_ids:
             market = self.market_loader.get_market(market_id)
             if market is None or market.clob_token_ids is None:
+                logger.warning("[DATA] Skipping market %s: no data or token IDs", market_id)
                 continue
             
             outcome_idx = self.outcome_indices.get(market_id, 0)
             if outcome_idx >= len(market.clob_token_ids):
+                logger.warning("[DATA] Skipping market %s: invalid outcome index %d", market_id, outcome_idx)
                 continue
             
             self._token_ids[market_id] = market.clob_token_ids[outcome_idx]
@@ -293,6 +241,7 @@ class CrossMarketIterator:
                 token_ids=market.clob_token_ids,
                 outcome_index=outcome_idx,
             )
+        logger.debug("[DATA] Initialized %d market streams", len(self._streams))
     
     def iter_snapshots(
         self,
@@ -300,18 +249,18 @@ class CrossMarketIterator:
         end_block: int | None = None,
         batch_size: int = 5000,
     ) -> Iterator[CrossMarketSnapshot]:
-        """Iterate over cross-market snapshots in tick order.
-        
-        Yields a snapshot at each tick position where any market has a trade.
-        The snapshot contains the current state of ALL markets at that position.
-        """
+        """Iterate over cross-market snapshots in tick order."""
         if not self._streams:
+            logger.warning("[DATA] No streams available for iteration")
             return
         
-        # Collect all token IDs for query
+        logger.info("[DATA] Starting cross-market iteration: %d markets, blocks %s to %s",
+                    len(self._streams), start_block, end_block)
+        start_time = time.time()
+        snapshot_count = 0
+        
         all_token_ids = list(self._token_ids.values())
         
-        # Fetch all trades for all markets
         trades_df = self.trade_loader.query_trades(
             asset_ids=all_token_ids,
             min_block=start_block,
@@ -320,15 +269,12 @@ class CrossMarketIterator:
         )
         
         if trades_df.is_empty():
+            logger.warning("[DATA] No trades found in block range")
             return
         
-        # Enrich with timestamps
         trades_df = self.trade_loader.enrich_with_timestamps(trades_df)
+        trades_df = trades_df.sort(["block_number", "log_index"])
         
-        # Sort by position
-        trades_df = trades_df.sort(['block_number', 'log_index'])
-        
-        # Track current state for each market
         states: dict[str, MarketStateSnapshot] = {}
         for market_id in self.market_ids:
             if market_id in self._token_ids:
@@ -340,16 +286,13 @@ class CrossMarketIterator:
                     timestamp=None,
                 )
         
-        # Iterate through trades and yield snapshots
         for row in trades_df.iter_rows(named=True):
-            position = TickPosition(row['block_number'], row['log_index'])
-            timestamp = row.get('block_timestamp')
+            position = TickPosition(row["block_number"], row["log_index"])
+            timestamp = row.get("block_timestamp")
             
-            # Determine which market this trade is for
-            maker_asset = str(row['maker_asset_id'])
-            taker_asset = str(row['taker_asset_id'])
+            maker_asset = str(row["maker_asset_id"])
+            taker_asset = str(row["taker_asset_id"])
             
-            # Find matching market
             trade_token = None
             for market_id, token_id in self._token_ids.items():
                 if token_id == maker_asset or token_id == taker_asset:
@@ -359,18 +302,16 @@ class CrossMarketIterator:
             if trade_token is None:
                 continue
             
-            # Calculate price
-            maker_amount = Decimal(row['maker_amount']) / Decimal(1_000_000)
-            taker_amount = Decimal(row['taker_amount']) / Decimal(1_000_000)
+            maker_amount = Decimal(row["maker_amount"]) / Decimal(1_000_000)
+            taker_amount = Decimal(row["taker_amount"]) / Decimal(1_000_000)
             
-            if maker_asset == '0' and taker_amount > 0:
+            if maker_asset == "0" and taker_amount > 0:
                 price = maker_amount / taker_amount
-            elif taker_asset == '0' and maker_amount > 0:
+            elif taker_asset == "0" and maker_amount > 0:
                 price = taker_amount / maker_amount
             else:
                 continue
             
-            # Update state for the affected market
             for market_id, token_id in self._token_ids.items():
                 if token_id == trade_token:
                     old_state = states[market_id]
@@ -386,43 +327,37 @@ class CrossMarketIterator:
                     )
                     break
             
-            # Yield snapshot with current states
+            snapshot_count += 1
             yield CrossMarketSnapshot(
                 position=position,
                 timestamp=timestamp,
-                states=dict(states),  # Copy to prevent mutation
+                states=dict(states),
             )
+        
+        elapsed = time.time() - start_time
+        logger.info("[DATA] Cross-market iteration complete: %d snapshots in %.3fs", snapshot_count, elapsed)
 
 
 def detect_price_divergence(
     snapshot: CrossMarketSnapshot,
-    threshold: Decimal = Decimal('0.02'),  # 2% threshold
+    threshold: Decimal = Decimal("0.02"),
 ) -> dict | None:
-    """Detect if prices in snapshot diverge beyond threshold.
-    
-    For binary markets, YES + NO should sum to ~1.0.
-    For related markets, check for mispricing based on logical constraints.
-    
-    Returns dict with divergence details if found, None otherwise.
-    """
+    """Detect if prices in snapshot diverge beyond threshold."""
     if not snapshot.has_all_prices():
         return None
     
     prices = snapshot.get_prices()
     
-    # Simple example: check if any price is obviously mispriced (< 0.01 or > 0.99)
     for market_id, price in prices.items():
         if price is not None:
-            if price < Decimal('0.01') or price > Decimal('0.99'):
+            if price < Decimal("0.01") or price > Decimal("0.99"):
+                logger.debug("[DATA] Extreme price detected: market=%s, price=%s", market_id, price)
                 return {
-                    'type': 'extreme_price',
-                    'market_id': market_id,
-                    'price': price,
-                    'position': snapshot.position,
-                    'timestamp': snapshot.timestamp,
+                    "type": "extreme_price",
+                    "market_id": market_id,
+                    "price": price,
+                    "position": snapshot.position,
+                    "timestamp": snapshot.timestamp,
                 }
-    
-    # More sophisticated divergence detection would go here
-    # (e.g., checking if related markets violate logical constraints)
     
     return None

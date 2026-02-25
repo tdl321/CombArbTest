@@ -1,236 +1,450 @@
-"""Semantic Market Clustering (LLM-02).
+"""Two-Stage Market Clustering with LLM.
 
-Groups semantically related Polymarket markets using LLM analysis.
-Example: "Trump wins PA", "Trump wins election", "Republican wins" -> same cluster
+Stage 1: Group semantically related markets
+Stage 2: Extract partition constraints for clusters with 3+ markets
+
+Focus on PARTITION detection for combinatorial arbitrage:
+- A partition is a set of 3+ markets that are BOTH exhaustive AND mutually exclusive
+- Partitions have the constraint: Σ P(markets) = 1 exactly
+- Binary (Yes/No) markets are NOT valid partitions
 """
 
 import json
 import logging
+import time
 from typing import Any
 
 from .client import LLMClient, get_client
-from .schema import MarketCluster, MarketInfo, RelationshipGraph
-
+from .schema import (
+    MarketCluster,
+    MarketInfo,
+    MarketRelationship,
+    RelationshipGraph,
+    RelationshipType,
+)
 
 logger = logging.getLogger(__name__)
 
+# Minimum markets required for partition-based arbitrage
+MIN_PARTITION_MARKETS = 3
 
-# System prompt for clustering task
-CLUSTERING_SYSTEM_PROMPT = """You are an expert analyst for prediction markets. Your task is to group semantically related markets into clusters.
 
-Markets are related if they:
-1. Refer to the same event or outcome (e.g., election results)
-2. Have logical dependencies (e.g., "Trump wins PA" relates to "Trump wins election")
-3. Share the same subject matter (e.g., all about 2024 US election)
-4. Have mutually exclusive outcomes (e.g., "Trump wins" vs "Biden wins")
+# =============================================================================
+# PROMPTS
+# =============================================================================
 
-For each cluster, provide:
-- A unique cluster_id (slug format, e.g., "us-2024-presidential")
-- A descriptive theme (e.g., "2024 US Presidential Election")
-- List of market IDs that belong together
+CLUSTERING_SYSTEM = """You are analyzing prediction markets to group semantically related ones.
 
-Markets that don't fit any cluster should go in individual clusters.
+Group markets that:
+1. Reference the same event (e.g., "2024 Presidential Election")
+2. Have competing outcomes (e.g., different candidates winning)
+3. Share the same subject (e.g., Bitcoin price targets)
 
+IMPORTANT: Prioritize creating groups of 3 or more markets that could form PARTITIONS
+(exhaustive and mutually exclusive sets where exactly one outcome must occur).
+
+Markets without clear relationships go in individual clusters.
 Respond with valid JSON only."""
 
+CLUSTERING_USER = """Group these prediction markets by semantic relationships.
 
-CLUSTERING_USER_PROMPT_TEMPLATE = """Analyze these prediction markets and group semantically related ones into clusters.
+IMPORTANT: Prioritize grouping markets that form PARTITIONS (3+ markets where
+exactly one outcome must occur, like election candidates or championship winners).
 
-Markets to analyze:
+Markets:
 {markets_json}
 
-Return a JSON object with this structure:
+Return JSON:
 {{
     "clusters": [
         {{
-            "cluster_id": "unique-slug-id",
-            "theme": "Human readable theme description",
-            "market_ids": ["market_id_1", "market_id_2", ...]
+            "cluster_id": "descriptive-slug",
+            "theme": "Description",
+            "market_ids": ["id1", "id2", "id3"]
+        }}
+    ]
+}}"""
+
+CONSTRAINTS_SYSTEM = """Identify PARTITION constraints between prediction markets for combinatorial arbitrage.
+
+## PARTITION REQUIREMENTS:
+- Must have 3 or more markets (NOT binary Yes/No markets)
+- Must be BOTH exhaustive AND mutually exclusive
+- Mathematical constraint: Σ P(outcomes) = 1 exactly
+
+## Examples of Valid Partitions:
+- Election winners (3+ candidates)
+- Championship outcomes (3+ teams)  
+- Score ranges (3+ buckets)
+- Date/time ranges (3+ periods)
+
+## What is NOT a Valid Partition:
+- Binary Yes/No markets (only 2 outcomes)
+- Simple pairwise constraints between 2 markets
+- Markets that are correlated but not mutually exclusive
+
+Be CONSERVATIVE. Only high-confidence partitions. Valid JSON only."""
+
+CONSTRAINTS_USER = """Identify PARTITION constraints in this market cluster.
+
+PARTITION REQUIREMENTS:
+- Must have 3 or more markets
+- Must be BOTH exhaustive AND mutually exclusive
+- Binary (Yes/No) markets should NOT be extracted as partitions
+
+Theme: {theme}
+
+Markets:
+{markets_json}
+
+Return JSON:
+{{
+    "constraints": [
+        {{
+            "type": "mutually_exclusive",
+            "from_market": "id",
+            "to_market": "id",
+            "confidence": 0.0-1.0,
+            "reasoning": "Brief explanation"
         }}
     ],
-    "reasoning": "Brief explanation of clustering logic"
+    "exhaustive_sets": [
+        {{
+            "market_ids": ["id1", "id2", "id3"],
+            "is_partition": true,
+            "confidence": 0.0-1.0,
+            "reasoning": "Why these form a complete partition with 3+ outcomes"
+        }}
+    ]
 }}
 
-Group markets that are semantically related. Each market should appear in exactly one cluster."""
+CRITICAL FILTERS:
+- exhaustive_sets with fewer than 3 markets should NOT be returned
+- Only return sets where EXACTLY ONE outcome must occur
+- Set "is_partition": true when the set is both exhaustive AND mutually exclusive"""
 
 
 class MarketClusterer:
-    """Groups semantically related markets using LLM analysis.
-    
-    Usage:
-        clusterer = MarketClusterer()
-        markets = [
-            MarketInfo(id="1", question="Will Trump win Pennsylvania?", outcomes=["Yes", "No"]),
-            MarketInfo(id="2", question="Will Trump win the 2024 election?", outcomes=["Yes", "No"]),
-            MarketInfo(id="3", question="Will Bitcoin hit 100k?", outcomes=["Yes", "No"]),
-        ]
-        clusters = clusterer.cluster_markets(markets)
-    """
-    
+    """Two-stage LLM clustering: grouping then partition extraction."""
+
     def __init__(
         self,
         client: LLMClient | None = None,
-        max_markets_per_batch: int = 30,
+        max_batch_size: int = 30,
         temperature: float = 0.2,
+        max_retries: int = 2,
+        min_confidence: float = 0.7,
     ):
-        """Initialize the clusterer.
-        
-        Args:
-            client: LLM client instance (uses singleton if not provided)
-            max_markets_per_batch: Max markets to send in one LLM call
-            temperature: LLM temperature (lower = more deterministic)
-        """
         self._client = client
-        self.max_markets_per_batch = max_markets_per_batch
+        self.max_batch_size = max_batch_size
         self.temperature = temperature
-    
+        self.max_retries = max_retries
+        self.min_confidence = min_confidence
+        logger.debug("[CLUSTER] MarketClusterer initialized: batch_size=%d, temp=%.1f, retries=%d",
+                     max_batch_size, temperature, max_retries)
+
     @property
     def client(self) -> LLMClient:
-        """Get or create LLM client."""
         if self._client is None:
             self._client = get_client()
         return self._client
-    
-    def cluster_markets(
-        self,
-        markets: list[MarketInfo],
-    ) -> list[MarketCluster]:
-        """Group markets into semantic clusters.
-        
-        Args:
-            markets: List of markets to cluster
-            
-        Returns:
-            List of MarketCluster objects
-        """
+
+    def cluster_and_extract(self, markets: list[MarketInfo]) -> RelationshipGraph:
+        """Main entry: cluster markets and extract partition constraints."""
         if not markets:
-            return []
+            logger.warning("[CLUSTER] No markets provided")
+            return RelationshipGraph(clusters=[])
+
+        logger.info("[CLUSTER] Starting with %d markets", len(markets))
+        start_time = time.time()
         
-        # For small batches, cluster directly
-        if len(markets) <= self.max_markets_per_batch:
+        # Stage 1: Cluster markets
+        clusters = self._stage1_cluster(markets)
+        
+        # Stage 2: Extract partition constraints for clusters with 3+ markets
+        enriched = []
+        skipped_count = 0
+        for cluster in clusters:
+            if len(cluster.market_ids) >= MIN_PARTITION_MARKETS:
+                constraints = self._stage2_constraints(cluster, markets)
+                cluster = MarketCluster(
+                    cluster_id=cluster.cluster_id,
+                    theme=cluster.theme,
+                    market_ids=cluster.market_ids,
+                    relationships=constraints,
+                )
+                enriched.append(cluster)
+            else:
+                skipped_count += 1
+        
+        graph = RelationshipGraph(
+            clusters=enriched,
+            model_used=getattr(self.client, "model", "unknown"),
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info("[CLUSTER] Done: %d partition clusters, %d constraints in %.3fs (skipped %d small clusters)",
+                    len(graph.clusters), graph.total_relationships, elapsed, skipped_count)
+        
+        # Log partition detection summary
+        partition_count = sum(1 for c in graph.clusters if self._is_partition_cluster(c))
+        if partition_count > 0:
+            logger.info("[CLUSTER] Detected %d valid partition clusters for arbitrage", partition_count)
+        
+        return graph
+    
+    def _is_partition_cluster(self, cluster: MarketCluster) -> bool:
+        """Check if a cluster represents a valid partition (3+ markets, exhaustive + exclusive)."""
+        if len(cluster.market_ids) < MIN_PARTITION_MARKETS:
+            return False
+        
+        if not cluster.relationships:
+            return False
+        
+        has_exhaustive = any(r.type == "exhaustive" for r in cluster.relationships)
+        exclusive_pairs = sum(
+            1 for r in cluster.relationships 
+            if r.type in ("mutually_exclusive", "incompatible") and r.to_market is not None
+        )
+        
+        n = len(cluster.market_ids)
+        expected_pairs = n * (n - 1) // 2
+        
+        return has_exhaustive and expected_pairs > 0 and exclusive_pairs >= expected_pairs * 0.5
+
+    def _stage1_cluster(self, markets: list[MarketInfo]) -> list[MarketCluster]:
+        """Stage 1: Group semantically related markets."""
+        logger.info("[STAGE1] Semantic clustering for %d markets", len(markets))
+        
+        if len(markets) <= self.max_batch_size:
             return self._cluster_batch(markets)
         
-        # For larger sets, batch and merge clusters
         all_clusters = []
-        for i in range(0, len(markets), self.max_markets_per_batch):
-            batch = markets[i:i + self.max_markets_per_batch]
-            batch_clusters = self._cluster_batch(batch)
-            all_clusters.extend(batch_clusters)
+        batch_num = 0
+        for i in range(0, len(markets), self.max_batch_size):
+            batch_num += 1
+            batch = markets[i:i + self.max_batch_size]
+            logger.info("[STAGE1] Batch %d: %d markets", batch_num, len(batch))
+            clusters = self._cluster_batch(batch)
+            all_clusters.extend(clusters)
         
-        # Merge similar clusters across batches
-        return self._merge_similar_clusters(all_clusters)
-    
+        logger.info("[STAGE1] All batches complete: %d total clusters", len(all_clusters))
+        return all_clusters
+
     def _cluster_batch(self, markets: list[MarketInfo]) -> list[MarketCluster]:
-        """Cluster a single batch of markets."""
-        # Format markets for the prompt
+        """Cluster a batch via LLM."""
         markets_data = [
-            {
-                "id": m.id,
-                "question": m.question,
-                "outcomes": m.outcomes,
-            }
+            {"id": m.id, "question": m.question, "outcomes": m.outcomes}
             for m in markets
         ]
-        markets_json = json.dumps(markets_data, indent=2)
         
-        prompt = CLUSTERING_USER_PROMPT_TEMPLATE.format(markets_json=markets_json)
+        prompt = CLUSTERING_USER.format(markets_json=json.dumps(markets_data, indent=2))
         
-        logger.info(f"Clustering {len(markets)} markets...")
+        logger.info("[STAGE1] LLM call: %d markets", len(markets))
+        start_time = time.time()
         
-        try:
-            response = self.client.chat_json(
-                prompt=prompt,
-                system=CLUSTERING_SYSTEM_PROMPT,
-                temperature=self.temperature,
-            )
-        except Exception as e:
-            logger.error(f"LLM clustering failed: {e}")
-            # Fallback: each market in its own cluster
-            return self._fallback_individual_clusters(markets)
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat_json(
+                    prompt=prompt,
+                    system=CLUSTERING_SYSTEM,
+                    temperature=self.temperature,
+                )
+                clusters = self._parse_clusters(response, markets)
+                elapsed = time.time() - start_time
+                logger.info("[STAGE1] Result: %d clusters in %.3fs", len(clusters), elapsed)
+                return clusters
+                
+            except Exception as e:
+                logger.warning("[STAGE1] Attempt %d failed: %s", attempt + 1, e)
+                if attempt == self.max_retries:
+                    logger.error("[STAGE1] All attempts failed, using fallback")
+                    return self._fallback_clusters(markets)
         
-        return self._parse_clustering_response(response, markets)
-    
-    def _parse_clustering_response(
-        self,
-        response: dict[str, Any],
-        markets: list[MarketInfo],
-    ) -> list[MarketCluster]:
-        """Parse LLM response into MarketCluster objects."""
+        return self._fallback_clusters(markets)
+
+    def _parse_clusters(self, response: dict[str, Any], markets: list[MarketInfo]) -> list[MarketCluster]:
+        """Parse LLM clustering response."""
         clusters = []
-        seen_market_ids = set()
-        valid_market_ids = {m.id for m in markets}
+        seen_ids = set()
+        valid_ids = {m.id for m in markets}
         
-        for cluster_data in response.get("clusters", []):
-            cluster_id = cluster_data.get("cluster_id", "unknown")
-            theme = cluster_data.get("theme", "Unknown Theme")
-            market_ids = cluster_data.get("market_ids", [])
-            
-            # Filter to only valid market IDs
-            valid_ids = [
-                mid for mid in market_ids 
-                if mid in valid_market_ids and mid not in seen_market_ids
+        for c in response.get("clusters", []):
+            market_ids = [
+                mid for mid in c.get("market_ids", [])
+                if mid in valid_ids and mid not in seen_ids
             ]
-            
-            if valid_ids:
+            if market_ids:
                 clusters.append(MarketCluster(
-                    cluster_id=cluster_id,
-                    theme=theme,
-                    market_ids=valid_ids,
+                    cluster_id=c.get("cluster_id", "unknown"),
+                    theme=c.get("theme", "Unknown"),
+                    market_ids=market_ids,
                 ))
-                seen_market_ids.update(valid_ids)
+                seen_ids.update(market_ids)
         
-        # Add unclustered markets to individual clusters
-        unclustered = [m for m in markets if m.id not in seen_market_ids]
-        for market in unclustered:
-            clusters.append(MarketCluster(
-                cluster_id=f"single-{market.id[:8]}",
-                theme=market.question[:50],
-                market_ids=[market.id],
+        # Handle unclustered markets - but don't create single-market clusters
+        # since they can't form partitions anyway
+        unclustered = [m for m in markets if m.id not in seen_ids]
+        if unclustered:
+            logger.debug("[STAGE1] %d markets unclustered (will be skipped - no partition possible)", 
+                        len(unclustered))
+        
+        return clusters
+
+    def _fallback_clusters(self, markets: list[MarketInfo]) -> list[MarketCluster]:
+        """Fallback: try to create one big cluster if possible."""
+        logger.warning("[STAGE1] Using fallback clustering")
+        if len(markets) >= MIN_PARTITION_MARKETS:
+            return [
+                MarketCluster(
+                    cluster_id="fallback-all",
+                    theme="All markets (fallback)",
+                    market_ids=[m.id for m in markets],
+                )
+            ]
+        return []
+
+    def _stage2_constraints(self, cluster: MarketCluster, all_markets: list[MarketInfo]) -> list[MarketRelationship]:
+        """Stage 2: Extract partition constraints for a cluster with 3+ markets."""
+        theme_short = cluster.theme[:40] + "..." if len(cluster.theme) > 40 else cluster.theme
+        logger.info("[STAGE2] Extracting partition constraints for: %s (%d markets)", 
+                    theme_short, len(cluster.market_ids))
+        
+        market_map = {m.id: m for m in all_markets}
+        cluster_markets = [market_map[mid] for mid in cluster.market_ids if mid in market_map]
+        
+        if len(cluster_markets) < MIN_PARTITION_MARKETS:
+            logger.debug("[STAGE2] Cluster has < %d markets, skipping", MIN_PARTITION_MARKETS)
+            return []
+        
+        markets_data = [
+            {"id": m.id, "question": m.question, "outcomes": m.outcomes}
+            for m in cluster_markets
+        ]
+        
+        prompt = CONSTRAINTS_USER.format(
+            theme=cluster.theme,
+            markets_json=json.dumps(markets_data, indent=2),
+        )
+        
+        logger.info("[STAGE2] LLM call: %d markets", len(cluster_markets))
+        start_time = time.time()
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat_json(
+                    prompt=prompt,
+                    system=CONSTRAINTS_SYSTEM,
+                    temperature=self.temperature,
+                )
+                constraints = self._parse_constraints(response, cluster.market_ids)
+                
+                elapsed = time.time() - start_time
+                by_type = {}
+                for c in constraints:
+                    by_type[c.type] = by_type.get(c.type, 0) + 1
+                logger.info("[STAGE2] Result: %d constraints %s in %.3fs", len(constraints), dict(by_type), elapsed)
+                
+                return constraints
+                
+            except Exception as e:
+                logger.warning("[STAGE2] Attempt %d failed: %s", attempt + 1, e)
+                if attempt == self.max_retries:
+                    logger.error("[STAGE2] All attempts failed, no constraints extracted")
+                    return []
+        
+        return []
+
+    def _parse_constraints(self, response: dict[str, Any], valid_ids: list[str]) -> list[MarketRelationship]:
+        """Parse LLM constraints response for partition constraints only."""
+        relationships = []
+        valid_set = set(valid_ids)
+        
+        # Only accept partition-related constraint types
+        partition_types = {"mutually_exclusive", "exhaustive"}
+        
+        # Parse individual constraints
+        for c in response.get("constraints", []):
+            rel_type = c.get("type", "")
+            from_id = c.get("from_market")
+            to_id = c.get("to_market")
+            confidence = float(c.get("confidence", 0))
+            
+            if rel_type not in partition_types:
+                logger.debug("[STAGE2] Skipping non-partition type: %s", rel_type)
+                continue
+            if from_id not in valid_set:
+                logger.debug("[STAGE2] Skipping invalid from_market: %s", from_id)
+                continue
+            if to_id and to_id not in valid_set:
+                logger.debug("[STAGE2] Skipping invalid to_market: %s", to_id)
+                continue
+            if confidence < self.min_confidence:
+                logger.debug("[STAGE2] Skipping low confidence constraint: %.2f", confidence)
+                continue
+            
+            relationships.append(MarketRelationship(
+                type=rel_type,
+                from_market=from_id,
+                to_market=to_id,
+                confidence=confidence,
+                reasoning=c.get("reasoning"),
             ))
         
-        return clusters
-    
-    def _fallback_individual_clusters(
-        self,
-        markets: list[MarketInfo],
-    ) -> list[MarketCluster]:
-        """Fallback: put each market in its own cluster."""
-        return [
-            MarketCluster(
-                cluster_id=f"single-{m.id[:8]}",
-                theme=m.question[:50],
-                market_ids=[m.id],
-            )
-            for m in markets
-        ]
-    
-    def _merge_similar_clusters(
-        self,
-        clusters: list[MarketCluster],
-    ) -> list[MarketCluster]:
-        """Merge clusters with similar themes.
+        # Parse exhaustive sets (require 3+ markets for partitions)
+        for ex in response.get("exhaustive_sets", []):
+            ids = [mid for mid in ex.get("market_ids", []) if mid in valid_set]
+            confidence = float(ex.get("confidence", 0))
+            reasoning = ex.get("reasoning", "")
+            is_partition = ex.get("is_partition", False)
+            
+            # CRITICAL: Require 3+ markets for valid partitions
+            if len(ids) < MIN_PARTITION_MARKETS:
+                logger.debug("[STAGE2] Skipping exhaustive set with < %d markets", MIN_PARTITION_MARKETS)
+                continue
+                
+            if confidence < self.min_confidence:
+                logger.debug("[STAGE2] Skipping low confidence exhaustive set: %.2f", confidence)
+                continue
+            
+            # Add pairwise mutual exclusivity constraints
+            for i, id1 in enumerate(ids):
+                for id2 in ids[i+1:]:
+                    relationships.append(MarketRelationship(
+                        type="mutually_exclusive",
+                        from_market=id1,
+                        to_market=id2,
+                        confidence=confidence,
+                        reasoning=reasoning,
+                    ))
+            
+            # Add exhaustive constraint
+            relationships.append(MarketRelationship(
+                type="exhaustive",
+                from_market=ids[0],
+                to_market=None,
+                confidence=confidence,
+                reasoning="Partition (%d markets): %s" % (len(ids), reasoning),
+            ))
+            
+            logger.info("[STAGE2] Detected partition: %d markets (%s)", len(ids), reasoning[:50])
         
-        TODO: Use LLM to identify similar clusters across batches.
-        For now, just returns the clusters as-is.
-        """
-        # Simple implementation: no merging
-        # A more sophisticated version would use embeddings or another
-        # LLM call to identify similar cluster themes
-        return clusters
+        return relationships
 
 
-def cluster_markets(
-    markets: list[MarketInfo],
-    client: LLMClient | None = None,
-) -> list[MarketCluster]:
-    """Convenience function to cluster markets.
-    
-    Args:
-        markets: List of MarketInfo objects
-        client: Optional LLM client
-        
-    Returns:
-        List of MarketCluster objects
-    """
+def cluster_markets(markets: list[MarketInfo], client: LLMClient | None = None) -> list[MarketCluster]:
+    """Cluster markets (Stage 1 only)."""
+    logger.debug("[CLUSTER] cluster_markets called with %d markets", len(markets))
     clusterer = MarketClusterer(client=client)
-    return clusterer.cluster_markets(markets)
+    graph = clusterer.cluster_and_extract(markets)
+    return graph.clusters
+
+
+def build_relationship_graph(markets: list[MarketInfo], client: LLMClient | None = None) -> RelationshipGraph:
+    """Full pipeline: cluster + extract partition constraints.
+    
+    Only includes clusters with 3+ markets for combinatorial arbitrage.
+    """
+    logger.debug("[CLUSTER] build_relationship_graph called with %d markets", len(markets))
+    clusterer = MarketClusterer(client=client)
+    return clusterer.cluster_and_extract(markets)

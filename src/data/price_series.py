@@ -1,11 +1,15 @@
 """Price series builder for Polymarket trade data."""
 
+import logging
+import time
 from datetime import datetime, timedelta
 from enum import Enum
 
 import polars as pl
 
 from .loader import BlockLoader, MarketLoader, TradeLoader
+
+logger = logging.getLogger(__name__)
 
 
 class Resolution(str, Enum):
@@ -39,6 +43,7 @@ class PriceSeriesBuilder:
         self.trade_loader = trade_loader
         self.market_loader = market_loader
         self.block_loader = block_loader
+        logger.debug("[DATA] PriceSeriesBuilder initialized")
 
     def build_price_series(
         self,
@@ -50,14 +55,21 @@ class PriceSeriesBuilder:
         limit: int = 50000,
     ) -> pl.DataFrame:
         """Build OHLCV price series for a market."""
+        logger.info("[DATA] Building price series for market %s, resolution=%s, outcome=%d",
+                    market_id, resolution.value, outcome_index)
+        start_ts = time.time()
+        
         market = self.market_loader.get_market(market_id)
         if market is None:
-            raise ValueError(f"Market {market_id} not found")
+            logger.error("[DATA] Market not found: %s", market_id)
+            raise ValueError("Market %s not found" % market_id)
         
         if market.clob_token_ids is None or len(market.clob_token_ids) <= outcome_index:
-            raise ValueError(f"Market {market_id} has no CLOB token ID for outcome {outcome_index}")
+            logger.error("[DATA] Market %s has no CLOB token ID for outcome %d", market_id, outcome_index)
+            raise ValueError("Market %s has no CLOB token ID for outcome %d" % (market_id, outcome_index))
 
         target_token_id = market.clob_token_ids[outcome_index]
+        logger.debug("[DATA] Target token ID: %s", target_token_id)
 
         # Get trades
         trades_df = self.trade_loader.get_trades_for_market(
@@ -66,6 +78,7 @@ class PriceSeriesBuilder:
         )
 
         if trades_df.is_empty():
+            logger.warning("[DATA] No trades found for market %s", market_id)
             return self._empty_series()
 
         # Enrich with timestamps
@@ -78,44 +91,37 @@ class PriceSeriesBuilder:
             trades_df = trades_df.filter(pl.col("block_timestamp") < end_time)
 
         if trades_df.is_empty():
+            logger.warning("[DATA] No trades in time range for market %s", market_id)
             return self._empty_series()
 
         # Calculate price for each trade
-        # Price is always USDC per outcome token
-        # maker_asset_id == '0' means maker provides USDC (buying tokens)
-        # taker_asset_id == '0' means taker provides USDC (selling tokens)
         trades_df = trades_df.with_columns([
             (pl.col("maker_amount") / 1_000_000).alias("maker_usd"),
             (pl.col("taker_amount") / 1_000_000).alias("taker_usd"),
         ]).with_columns([
-            # Price calculation: USDC / tokens
             pl.when(pl.col("maker_asset_id") == "0")
-            .then(pl.col("maker_usd") / pl.col("taker_usd"))  # BUY: USDC paid / tokens received
+            .then(pl.col("maker_usd") / pl.col("taker_usd"))
             .when(pl.col("taker_asset_id") == "0")
-            .then(pl.col("taker_usd") / pl.col("maker_usd"))  # SELL: USDC received / tokens sold
+            .then(pl.col("taker_usd") / pl.col("maker_usd"))
             .otherwise(None)
             .alias("price"),
-            # Volume in tokens
             pl.when(pl.col("maker_asset_id") == "0")
-            .then(pl.col("taker_usd"))  # Tokens bought
+            .then(pl.col("taker_usd"))
             .when(pl.col("taker_asset_id") == "0")
-            .then(pl.col("maker_usd"))  # Tokens sold
+            .then(pl.col("maker_usd"))
             .otherwise(pl.lit(0.0))
             .alias("volume"),
-            # Is this trade for our target outcome?
             pl.when(
                 (pl.col("maker_asset_id") == target_token_id) | 
                 (pl.col("taker_asset_id") == target_token_id)
             ).then(True).otherwise(False).alias("is_target"),
         ])
 
-        # Filter to only trades for the target outcome
         trades_df = trades_df.filter(pl.col("is_target"))
-
-        # Filter out null prices
         trades_df = trades_df.filter(pl.col("price").is_not_null())
 
         if trades_df.is_empty():
+            logger.warning("[DATA] No valid price data for market %s", market_id)
             return self._empty_series()
 
         # Aggregate into OHLCV buckets
@@ -124,7 +130,7 @@ class PriceSeriesBuilder:
         ohlcv = (
             trades_df
             .with_columns([
-                (pl.col("block_timestamp").dt.truncate(f"{bucket_seconds}s")).alias("bucket"),
+                (pl.col("block_timestamp").dt.truncate("%ds" % bucket_seconds)).alias("bucket"),
             ])
             .group_by("bucket")
             .agg([
@@ -139,6 +145,8 @@ class PriceSeriesBuilder:
             .rename({"bucket": "timestamp"})
         )
 
+        elapsed = time.time() - start_ts
+        logger.info("[DATA] Built price series: %d candles in %.3fs", len(ohlcv), elapsed)
         return ohlcv
 
     def get_price_at_time(
@@ -149,31 +157,31 @@ class PriceSeriesBuilder:
         lookback_trades: int = 1000,
     ) -> float | None:
         """Get the most recent price as of a specific time (DATA-04)."""
+        logger.debug("[DATA] Getting price at %s for market %s", as_of, market_id)
+        
         market = self.market_loader.get_market(market_id)
         if market is None or market.clob_token_ids is None:
+            logger.warning("[DATA] Market not found or no token IDs: %s", market_id)
             return None
 
         target_token_id = market.clob_token_ids[outcome_index]
 
-        # Get recent trades
         trades_df = self.trade_loader.get_trades_for_market(
             market.clob_token_ids,
             limit=lookback_trades,
         )
 
         if trades_df.is_empty():
+            logger.debug("[DATA] No trades found for market %s", market_id)
             return None
 
-        # Enrich with timestamps
         trades_df = self.trade_loader.enrich_with_timestamps(trades_df)
-        
-        # Filter to trades before as_of
         trades_df = trades_df.filter(pl.col("block_timestamp") <= as_of)
 
         if trades_df.is_empty():
+            logger.debug("[DATA] No trades before %s for market %s", as_of, market_id)
             return None
 
-        # Calculate prices
         trades_df = trades_df.with_columns([
             (pl.col("maker_amount") / 1_000_000).alias("maker_usd"),
             (pl.col("taker_amount") / 1_000_000).alias("taker_usd"),
@@ -190,15 +198,17 @@ class PriceSeriesBuilder:
             ).then(True).otherwise(False).alias("is_target"),
         ])
 
-        # Filter to target outcome with valid prices
         trades_df = trades_df.filter(
             pl.col("is_target") & pl.col("price").is_not_null()
         ).sort("block_timestamp", descending=True)
 
         if trades_df.is_empty():
+            logger.debug("[DATA] No valid prices for market %s at %s", market_id, as_of)
             return None
 
-        return trades_df["price"][0]
+        price = trades_df["price"][0]
+        logger.debug("[DATA] Price for %s at %s: %.4f", market_id, as_of, price)
+        return price
 
     def _empty_series(self) -> pl.DataFrame:
         return pl.DataFrame({
@@ -226,12 +236,15 @@ class PointInTimeDataAccess:
         self.trade_loader = trade_loader
         self.price_builder = price_builder
         self.as_of = as_of
+        logger.debug("[DATA] PointInTimeDataAccess initialized for %s", as_of)
 
     def get_market(self, market_id: str):
+        logger.debug("[DATA] Getting market %s as of %s", market_id, self.as_of)
         market = self.market_loader.get_market(market_id)
         if market is None:
             return None
         if market.created_at is not None and market.created_at > self.as_of:
+            logger.debug("[DATA] Market %s did not exist at %s", market_id, self.as_of)
             return None
         return market
 

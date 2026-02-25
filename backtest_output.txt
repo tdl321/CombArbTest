@@ -1,0 +1,218 @@
+2026-02-24 19:50:11,410 - INFO - Clustering 30 markets...
+2026-02-24 19:50:13,083 - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-24 19:50:27,156 - INFO - Extracting relationships for cluster 'us-2024-presidential' with 9 markets...
+2026-02-24 19:50:27,421 - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-24 19:51:05,110 - INFO - Extracting relationships for cluster '2025-nba-finals' with 5 markets...
+2026-02-24 19:51:06,499 - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-24 19:51:21,535 - INFO - Extracting relationships for cluster 'super-bowl-2025' with 4 markets...
+2026-02-24 19:51:22,749 - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-24 19:51:32,373 - INFO - Extracting relationships for cluster 'fed-interest-rates' with 5 markets...
+2026-02-24 19:51:34,014 - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-24 19:51:43,827 - INFO - Starting backtest with 30 markets
+2026-02-24 19:51:44,289 - INFO - Loaded 30 markets
+2026-02-24 19:51:44,289 - INFO - Running walk-forward simulation...
+2026-02-24 19:51:44,289 - INFO - Starting simulation with 30 markets
+2026-02-24 19:51:50,876 - INFO - Simulation complete: processed 5000 ticks, found 0 opportunities
+2026-02-24 19:51:50,876 - INFO - Found 0 opportunities
+======================================================================
+DEEP-DIVE COMBINATORIAL ARBITRAGE BACKTEST
+======================================================================
+
+Searching for high-volume markets...
+  253591... | Vol: $1531.5M | Will Donald Trump win the 2024 US Presidential Election...
+  253597... | Vol: $1037.0M | Will Kamala Harris win the 2024 US Presidential Electio...
+  511754... | Vol: $400.4M | Will Donald Trump be inaugurated?...
+  507892... | Vol: $378.0M | Will the Sacramento Kings win the 2025 NBA Finals?...
+  512340... | Vol: $326.5M | Will Nicolae Ciucă win the 2024 Romanian Presidential e...
+  546814... | Vol: $242.2M | Will Zelenskyy wear a suit before July?...
+  253642... | Vol: $241.7M | Will any other Republican Politician win the 2024 US Pr...
+  601697... | Vol: $235.1M | Fed decreases interest rates by 50+ bps after January 2...
+  601700... | Vol: $216.5M | Fed increases interest rates by 25+ bps after January 2...
+  253727... | Vol: $163.8M | Kamala Harris wins the popular vote?...
+  570360... | Vol: $161.6M | Fed decreases interest rates by 50+ bps after December ...
+  680392... | Vol: $155.1M | US government shutdown Saturday?...
+  507894... | Vol: $154.2M | Will the Toronto Raptors win the 2025 NBA Finals?...
+  253609... | Vol: $153.4M | Will Michelle Obama win the 2024 US Presidential Electi...
+  538932... | Vol: $143.3M | Will Zohran Mamdani win the 2025 NYC mayoral election?...
+  253595... | Vol: $141.6M | Will Robert F. Kennedy Jr. win the 2024 US Presidential...
+  503301... | Vol: $139.3M | Will the Panthers win Super Bowl 2025?...
+  504494... | Vol: $134.0M | Fed increases interest rates by 25+ bps after November ...
+  570363... | Vol: $133.2M | Fed increases interest rates by 25+ bps after December ...
+  507286... | Vol: $133.1M | Will Aston Villa win the UEFA Champions League?...
+  507896... | Vol: $130.2M | Will the Washington Wizards win the 2025 NBA Finals?...
+  507895... | Vol: $129.9M | Will the Utah Jazz win the 2025 NBA Finals?...
+  503314... | Vol: $124.0M | Will the Raiders win Super Bowl 2025?...
+  253706... | Vol: $119.9M | Will Donald Trump win the popular vote in the 2024 Pres...
+  507276... | Vol: $119.7M | TikTok banned in the US before May 2025?...
+  503327... | Vol: $119.5M | Will the Titans win Super Bowl 2025?...
+  507859... | Vol: $116.7M | Will the Charlotte Hornets win the 2025 NBA Finals?...
+  253641... | Vol: $116.6M | Will any other Democratic Politician win the 2024 US Pr...
+  503304... | Vol: $115.3M | Will the Browns win Super Bowl 2025?...
+  529278... | Vol: $115.1M | Will Frances Fitzgerald win the Irish Presidential Elec...
+
+30 markets loaded
+
+======================================================================
+LLM RELATIONSHIP DISCOVERY
+======================================================================
+
+Clusters found: 11
+
+  Cluster: us-2024-presidential
+  Theme: 2024 US Presidential Election
+  Markets: 9
+    - Will Donald Trump win the 2024 US Presidential Ele...
+    - Will Kamala Harris win the 2024 US Presidential El...
+    - Will Donald Trump be inaugurated?...
+    ... and 6 more
+  Relationships: 17
+    - mutually_exclusive: 253591 -> 253597 (conf: 1.00)
+    - mutually_exclusive: 253591 -> 253642 (conf: 1.00)
+    - mutually_exclusive: 253591 -> 253641 (conf: 1.00)
+    ... and 14 more
+
+  Cluster: 2025-nba-finals
+  Theme: 2025 NBA Finals
+  Markets: 5
+    - Will the Sacramento Kings win the 2025 NBA Finals?...
+    - Will the Toronto Raptors win the 2025 NBA Finals?...
+    - Will the Washington Wizards win the 2025 NBA Final...
+    ... and 2 more
+  Relationships: 10
+    - mutually_exclusive: 507892 -> 507894 (conf: 1.00)
+    - mutually_exclusive: 507892 -> 507896 (conf: 1.00)
+    - mutually_exclusive: 507892 -> 507895 (conf: 1.00)
+    ... and 7 more
+
+  Cluster: super-bowl-2025
+  Theme: Super Bowl 2025
+  Markets: 4
+    - Will the Panthers win Super Bowl 2025?...
+    - Will the Raiders win Super Bowl 2025?...
+    - Will the Titans win Super Bowl 2025?...
+    ... and 1 more
+  Relationships: 6
+    - mutually_exclusive: 503301 -> 503314 (conf: 1.00)
+    - mutually_exclusive: 503301 -> 503327 (conf: 1.00)
+    - mutually_exclusive: 503301 -> 503304 (conf: 1.00)
+    ... and 3 more
+
+  Cluster: fed-interest-rates
+  Theme: Federal Reserve Interest Rate Changes
+  Markets: 5
+    - Fed decreases interest rates by 50+ bps after Janu...
+    - Fed increases interest rates by 25+ bps after Janu...
+    - Fed decreases interest rates by 50+ bps after Dece...
+    ... and 2 more
+  Relationships: 4
+    - mutually_exclusive: 601697 -> 601700 (conf: 1.00)
+    - mutually_exclusive: 570360 -> 570363 (conf: 1.00)
+    - prerequisite: 570360 -> 601697 (conf: 0.80)
+    ... and 1 more
+
+  Cluster: romanian-2024-presidential
+  Theme: 2024 Romanian Presidential Election
+  Markets: 1
+    - Will Nicolae Ciucă win the 2024 Romanian President...
+  Relationships: 0
+
+  Cluster: zelenskyy-suit
+  Theme: Zelenskyy wearing a suit before July
+  Markets: 1
+    - Will Zelenskyy wear a suit before July?...
+  Relationships: 0
+
+  Cluster: nyc-2025-mayoral
+  Theme: 2025 NYC Mayoral Election
+  Markets: 1
+    - Will Zohran Mamdani win the 2025 NYC mayoral elect...
+  Relationships: 0
+
+  Cluster: uefa-champions-league
+  Theme: UEFA Champions League
+  Markets: 1
+    - Will Aston Villa win the UEFA Champions League?...
+  Relationships: 0
+
+  Cluster: us-tiktok-ban
+  Theme: TikTok ban in the US before May 2025
+  Markets: 1
+    - TikTok banned in the US before May 2025?...
+  Relationships: 0
+
+  Cluster: us-government-shutdown
+  Theme: US Government Shutdown
+  Markets: 1
+    - US government shutdown Saturday?...
+  Relationships: 0
+
+  Cluster: irish-presidential-election
+  Theme: Irish Presidential Election
+  Markets: 1
+    - Will Frances Fitzgerald win the Irish Presidential...
+  Relationships: 0
+
+Total relationships discovered: 37
+
+======================================================================
+RUNNING DEEP BACKTEST
+KL Threshold: 0.0001 (very sensitive)
+Max ticks: 100,000
+======================================================================
+
+
+============================================================
+BACKTEST REPORT
+============================================================
+
+Time Range
+----------------------------------------
+  Start:    2026-02-24T19:51:50.876902
+  End:      2026-02-24T19:51:50.876905
+  Duration: 0.0 hours
+
+Market Coverage
+----------------------------------------
+  Markets Analyzed: 30
+  Clusters Found:   11
+
+Opportunities
+----------------------------------------
+  Total Found:    0
+  Per Hour:       0.00
+
+PnL Summary (per $1 stake per market)
+----------------------------------------
+  Gross PnL:          $0.0000
+  Transaction Costs:  $0.0000
+  Net PnL:            $0.0000
+
+Win/Loss Analysis
+----------------------------------------
+  Wins:       0
+  Losses:     0
+  Win Rate:   0.0%
+
+KL Divergence Statistics
+----------------------------------------
+  Average:  0.000000
+  Maximum:  0.000000
+  Minimum:  0.000000
+
+Risk Metrics
+----------------------------------------
+  Max Drawdown:  $0.0000
+
+Configuration
+----------------------------------------
+  KL Threshold:      0.0001
+  Transaction Cost:  1.5%
+
+============================================================
+
+No opportunities found. Markets appear efficiently priced.
+This suggests the relationship constraints are satisfied by market prices.
+
+======================================================================
+BACKTEST COMPLETE
+======================================================================
