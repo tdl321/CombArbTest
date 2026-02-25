@@ -100,7 +100,7 @@ class WalkForwardSimulator:
             "[SIM] Starting simulation: %d markets, %d clusters, violation_threshold=%.4f",
             len(market_ids),
             len(relationship_graph.clusters),
-            config.violation_threshold
+            config.kl_threshold
         )
         start_time = time.time()
 
@@ -384,11 +384,11 @@ class WalkForwardSimulator:
         # KL divergence for partition is related to the sum deviation
         kl_divergence = abs(violation.violation_amount)
         
-        if kl_divergence < config.violation_threshold:
+        if kl_divergence < config.kl_threshold:
             logger.debug(
                 "[SIM] Partition signal below threshold: kl=%.4f < %.4f",
                 kl_divergence,
-                config.violation_threshold
+                config.kl_threshold
             )
             return None
         
@@ -440,7 +440,7 @@ class WalkForwardSimulator:
             relationships=graph,
         )
 
-        if result.kl_divergence < config.violation_threshold:
+        if result.kl_divergence < config.kl_threshold:
             return None
 
         markets = list(prices.keys())
@@ -753,7 +753,7 @@ class WalkForwardSimulator:
             relationships=graph,
         )
 
-        if result.kl_divergence < config.violation_threshold:
+        if result.kl_divergence < config.kl_threshold:
             return None
 
         logger.debug(
@@ -898,7 +898,7 @@ def run_backtest_with_report(
     logger.info(
         "[BACKTEST] Config: markets=%d, violation_threshold=%.4f, tx_cost=%.4f, output=%s",
         len(market_ids),
-        config.violation_threshold,
+        config.kl_threshold,
         config.transaction_cost,
         output_dir
     )
