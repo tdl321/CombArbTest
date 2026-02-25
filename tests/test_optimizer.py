@@ -1,237 +1,273 @@
-#!/usr/bin/env python3
-"""Unit tests for the Optimization Engine.
+"""Tests for marginal polytope arbitrage optimizer.
 
-Tests OPT-01 through OPT-05 with known arbitrage cases.
+Tests the condition space model, LMO, Frank-Wolfe optimization,
+and arbitrage detection.
 """
-
-import sys
-sys.path.insert(0, "/root/combarbbot")
 
 import numpy as np
 import pytest
 
 from src.optimizer import (
-    # Schema
-    MarketRelationship,
+    ConditionSpace,
+    MarginalConstraintBuilder,
+    MarginalPolytopeLMO,
     MarketCluster,
+    MarketRelationship,
     RelationshipGraph,
-    ArbitrageResult,
-    OptimizationConfig,
-    # Divergence
-    kl_divergence,
-    kl_gradient,
-    # LMO
-    ConstraintBuilder,
-    LinearMinimizationOracle,
-    # Frank-Wolfe
-    frank_wolfe,
-    barrier_frank_wolfe,
-    find_arbitrage,
-    find_arbitrage_simple,
+    RelationshipType,
+    build_constraints_from_graph,
+    build_theta_from_prices,
+    categorical_kl,
+    detect_arbitrage_simple,
+    find_marginal_arbitrage,
+    marginal_frank_wolfe,
 )
 
 
-class TestKLDivergence:
-    """Test OPT-04: KL Divergence calculations."""
-    
-    def test_kl_identical(self):
-        """KL(p || p) = 0."""
-        p = np.array([0.3, 0.7])
-        assert kl_divergence(p, p) < 1e-10
-    
-    def test_kl_positive(self):
-        """KL is always non-negative."""
-        p = np.array([0.2, 0.8])
-        q = np.array([0.4, 0.6])
-        assert kl_divergence(p, q) >= 0
-    
-    def test_kl_asymmetric(self):
-        """KL(p || q) != KL(q || p) in general."""
-        p = np.array([0.2, 0.8])
-        q = np.array([0.4, 0.6])
-        kl_pq = kl_divergence(p, q)
-        kl_qp = kl_divergence(q, p)
-        assert kl_pq != kl_qp
-    
-    def test_kl_gradient_direction(self):
-        """Gradient should point toward reducing divergence."""
-        p = np.array([0.3, 0.7])
-        q = np.array([0.5, 0.5])
-        grad = kl_gradient(p, q)
-        # Gradient points away from p, so where p < q, gradient is positive
-        # (increase q makes it farther), where p > q, gradient is negative
-        # p[0]=0.3 < q[0]=0.5: grad[0] should be positive
-        # p[1]=0.7 > q[1]=0.5: grad[1] should be negative
-        assert grad[0] > 0  # Moving q[0] up increases divergence
-        assert grad[1] < 0  # Moving q[1] up decreases divergence
+class TestConditionSpace:
+    """Tests for ConditionSpace data structure."""
+
+    def test_from_market_data_default_outcomes(self):
+        """Two markets with default YES/NO outcomes should have 4 conditions."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+
+        assert space.n_conditions() == 4
+        assert space.n_markets() == 2
+        assert space.market_ids == ["A", "B"]
+
+    def test_from_market_data_custom_outcomes(self):
+        """Custom outcomes should work."""
+        space = ConditionSpace.from_market_data(
+            ["winner"],
+            market_outcomes={"winner": ["Alice", "Bob", "Charlie"]},
+        )
+
+        assert space.n_conditions() == 3
+        assert space.n_markets() == 1
+
+    def test_get_condition_indices(self):
+        """Should return correct indices for each market."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+
+        a_indices = space.get_condition_indices("A")
+        b_indices = space.get_condition_indices("B")
+
+        assert len(a_indices) == 2
+        assert len(b_indices) == 2
+        assert set(a_indices).isdisjoint(set(b_indices))
+
+    def test_get_yes_no_index(self):
+        """Should return YES as index 0, NO as index 1."""
+        space = ConditionSpace.from_market_data(["A"])
+
+        yes_idx = space.get_yes_index("A")
+        no_idx = space.get_no_index("A")
+
+        assert yes_idx == 0
+        assert no_idx == 1
 
 
-class TestConstraintBuilder:
-    """Test OPT-02: Constraint building."""
-    
+class TestMarginalConstraintBuilder:
+    """Tests for constraint building."""
+
+    def test_exactly_one_constraints(self):
+        """Each market should have exactly-one constraint."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        builder = MarginalConstraintBuilder(space)
+        constraints = builder.build()
+
+        # Should have 2 equality constraints (one per market)
+        assert constraints.A_eq.shape[0] == 2
+        assert np.allclose(constraints.b_eq, [1.0, 1.0])
+
     def test_implies_constraint(self):
-        """Test A implies B: P(A) <= P(B)."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_implies("A", "B")
+        """B->A implication should add inequality constraint."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        builder = MarginalConstraintBuilder(space)
+        builder.add_implies("B", "A")
         constraints = builder.build()
-        
-        # Should have 1 constraint: x[0] - x[1] <= 0
-        assert constraints.A.shape == (1, 2)
-        assert constraints.A[0, 0] == 1.0
-        assert constraints.A[0, 1] == -1.0
-        assert constraints.b[0] == 0.0
-    
-    def test_mutual_exclusivity(self):
-        """Test mutual exclusivity: P(A) + P(B) <= 1."""
-        builder = ConstraintBuilder(["A", "B"])
+
+        # Should have 1 inequality constraint
+        assert constraints.A_ub.shape[0] == 1
+
+        # Constraint: z_B_yes - z_A_yes <= 0
+        b_yes = space.get_yes_index("B")
+        a_yes = space.get_yes_index("A")
+        row = constraints.A_ub[0]
+        assert row[b_yes] == 1.0
+        assert row[a_yes] == -1.0
+
+    def test_mutually_exclusive_constraint(self):
+        """Mutex constraint should limit sum to 1."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        builder = MarginalConstraintBuilder(space)
         builder.add_mutually_exclusive("A", "B")
         constraints = builder.build()
-        
-        # Should have 1 constraint: x[0] + x[1] <= 1
-        assert constraints.A.shape == (1, 2)
-        assert constraints.A[0, 0] == 1.0
-        assert constraints.A[0, 1] == 1.0
-        assert constraints.b[0] == 1.0
-    
-    def test_binary_market(self):
-        """Test binary market: P(YES) + P(NO) = 1."""
-        builder = ConstraintBuilder(["YES", "NO"])
-        builder.add_binary_market("YES", "NO")
-        constraints = builder.build()
-        
-        # Should have 2 constraints for equality
-        assert constraints.A.shape == (2, 2)
+
+        # Should have 1 inequality constraint
+        assert constraints.A_ub.shape[0] == 1
+        assert constraints.b_ub[0] == 1.0
 
 
-class TestLMO:
-    """Test OPT-02: Linear Minimization Oracle."""
-    
-    def test_lmo_simple(self):
-        """LMO should find vertex in direction of gradient."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_mutually_exclusive("A", "B")
+class TestMarginalPolytopeLMO:
+    """Tests for the Linear Minimization Oracle."""
+
+    def test_two_independent_markets_4_vertices(self):
+        """Two independent binary markets should have 4 vertices."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        builder = MarginalConstraintBuilder(space)
         constraints = builder.build()
-        
-        lmo = LinearMinimizationOracle(constraints)
-        
-        # Gradient pointing toward A
-        g = np.array([-1.0, 0.0])
-        x, obj = lmo.solve(g)
-        
-        # Should maximize A (minimize -A), so A=1
-        assert x[0] > 0.9
-    
-    def test_lmo_respects_constraints(self):
-        """LMO solution should satisfy constraints."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_implies("A", "B")  # P(A) <= P(B)
+        lmo = MarginalPolytopeLMO(constraints)
+
+        vertices = lmo.enumerate_vertices(max_vertices=10)
+
+        # Should find exactly 4 vertices: (0,1,0,1), (0,1,1,0), (1,0,0,1), (1,0,1,0)
+        assert len(vertices) == 4
+
+        # Each vertex should be binary
+        for v in vertices:
+            assert np.all((v == 0) | (v == 1))
+
+        # Each vertex should satisfy exactly-one constraint
+        for v in vertices:
+            for market_id in space.market_ids:
+                indices = space.get_condition_indices(market_id)
+                assert sum(v[i] for i in indices) == 1
+
+    def test_implication_reduces_vertices(self):
+        """B->A implication should reduce vertices from 4 to 3."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        builder = MarginalConstraintBuilder(space)
+        builder.add_implies("B", "A")
         constraints = builder.build()
-        
-        lmo = LinearMinimizationOracle(constraints)
-        
-        g = np.array([-1.0, 1.0])  # Want high A, low B
-        x, _ = lmo.solve(g)
-        
-        # Should have A <= B
-        assert x[0] <= x[1] + 1e-6
-    
-    def test_lmo_extreme_points(self):
-        """Should find multiple extreme points."""
-        builder = ConstraintBuilder(["A", "B"])
-        constraints = builder.build()  # Just box constraints
-        
-        lmo = LinearMinimizationOracle(constraints)
-        points = lmo.get_extreme_points(10)
-        
-        # Should find vertices of [0,1]^2
-        assert len(points) >= 2
+        lmo = MarginalPolytopeLMO(constraints)
+
+        vertices = lmo.enumerate_vertices(max_vertices=10)
+
+        # Should have only 3 valid vertices:
+        # (A=YES, B=YES), (A=YES, B=NO), (A=NO, B=NO)
+        # NOT (A=NO, B=YES) because B->A
+        assert len(vertices) == 3
+
+        # Verify no vertex has A=NO and B=YES
+        a_yes = space.get_yes_index("A")
+        b_yes = space.get_yes_index("B")
+
+        for v in vertices:
+            # If B=YES, then A must be YES
+            if v[b_yes] == 1:
+                assert v[a_yes] == 1, "Implication violated: B=YES but A=NO"
+
+    def test_lmo_solve_minimizes_gradient(self):
+        """LMO should return vertex minimizing gradient."""
+        space = ConditionSpace.from_market_data(["A"])
+        builder = MarginalConstraintBuilder(space)
+        constraints = builder.build()
+        lmo = MarginalPolytopeLMO(constraints)
+
+        # Gradient favoring YES (negative at YES index)
+        gradient = np.array([-1.0, 1.0])
+        z, obj = lmo.solve(gradient)
+
+        # Should return (1, 0) - YES outcome
+        assert z[0] == 1.0 and z[1] == 0.0
 
 
-class TestFrankWolfe:
-    """Test OPT-01, OPT-03, OPT-05: Frank-Wolfe solver."""
-    
-    def test_implies_arbitrage(self):
-        """Test: A implies B but P(A) > P(B) is arbitrage.
-        
-        Example: Market A at 0.6, Market B at 0.5
-        A implies B means P(A) <= P(B), so this is violated.
-        Coherent prices should satisfy P(A) <= P(B).
-        """
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_implies("A", "B")
-        constraints = builder.build()
-        
-        # Prices violating A implies B
-        prices = {"A": 0.6, "B": 0.5}
-        
-        config = OptimizationConfig(max_iterations=5000, tolerance=1e-4)
-        result = frank_wolfe(prices, constraints, config)
-        
-        # Coherent prices should satisfy A <= B
-        assert result.coherent_prices["A"] <= result.coherent_prices["B"] + 1e-4
-        
-        # Original violated, so KL > 0
-        assert result.kl_divergence > 1e-6
-        
-        print("Original: A=%s, B=%s" % (prices["A"], prices["B"]))
-        print("Coherent: A=%.4f, B=%.4f" % (result.coherent_prices["A"], result.coherent_prices["B"]))
-        print("KL divergence: %.6f" % result.kl_divergence)
-    
-    def test_already_coherent(self):
-        """If prices already satisfy constraints, minimal change."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_implies("A", "B")
-        constraints = builder.build()
-        
-        # Prices already satisfying A implies B
-        prices = {"A": 0.4, "B": 0.6}
-        
-        result = frank_wolfe(prices, constraints)
-        
-        # Should converge quickly with low KL
+class TestCategoricalKL:
+    """Tests for KL divergence functions."""
+
+    def test_kl_same_distribution_is_zero(self):
+        """KL(p || p) should be 0."""
+        space = ConditionSpace.from_market_data(["A"])
+        theta = np.array([0.6, 0.4])
+        mu = np.array([0.6, 0.4])
+
+        kl = categorical_kl(theta, mu, space)
+        assert kl < 1e-10
+
+    def test_kl_different_distributions(self):
+        """KL(p || q) should be positive for p != q."""
+        space = ConditionSpace.from_market_data(["A"])
+        theta = np.array([0.8, 0.2])
+        mu = np.array([0.5, 0.5])
+
+        kl = categorical_kl(theta, mu, space)
+        assert kl > 0
+
+    def test_build_theta_from_prices(self):
+        """Should correctly convert market prices to theta vector."""
+        space = ConditionSpace.from_market_data(["A", "B"])
+        market_prices = {"A": [0.3, 0.7], "B": [0.6, 0.4]}
+
+        theta = build_theta_from_prices(market_prices, space)
+
+        # Verify values
+        a_indices = space.get_condition_indices("A")
+        b_indices = space.get_condition_indices("B")
+
+        assert np.isclose(theta[a_indices[0]], 0.3)
+        assert np.isclose(theta[a_indices[1]], 0.7)
+        assert np.isclose(theta[b_indices[0]], 0.6)
+        assert np.isclose(theta[b_indices[1]], 0.4)
+
+
+class TestMarginalFrankWolfe:
+    """Tests for the Frank-Wolfe optimization."""
+
+    def test_coherent_prices_remain_unchanged(self):
+        """Prices already satisfying constraints should have KL ~= 0."""
+        # Independent markets - any prices are coherent
+        result = detect_arbitrage_simple(
+            market_prices={"A": [0.5, 0.5], "B": [0.5, 0.5]},
+        )
+
         assert result.kl_divergence < 0.01
-    
-    def test_barrier_variant(self):
-        """Test barrier Frank-Wolfe for numerical stability."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder.add_implies("A", "B")
-        builder.add_mutually_exclusive("A", "B")  # Extra constraint
-        constraints = builder.build()
-        
-        prices = {"A": 0.6, "B": 0.5}
-        
-        result = barrier_frank_wolfe(prices, constraints)
-        
-        assert result.coherent_prices["A"] <= result.coherent_prices["B"] + 1e-4
-        assert result.coherent_prices["A"] + result.coherent_prices["B"] <= 1.0 + 1e-4
-    
-    def test_three_markets(self):
-        """Test with three markets and chain of implications."""
-        # A implies B implies C
-        builder = ConstraintBuilder(["A", "B", "C"])
-        builder.add_implies("A", "B")
-        builder.add_implies("B", "C")
-        constraints = builder.build()
-        
-        # Violates chain: A > B and B > C
-        prices = {"A": 0.7, "B": 0.5, "C": 0.3}
-        
-        config = OptimizationConfig(max_iterations=5000, tolerance=1e-4)
-        result = frank_wolfe(prices, constraints, config)
-        
-        # Should have A <= B <= C
-        assert result.coherent_prices["A"] <= result.coherent_prices["B"] + 1e-3
-        assert result.coherent_prices["B"] <= result.coherent_prices["C"] + 1e-3
-        
-        print("Original: A=%s, B=%s, C=%s" % (prices["A"], prices["B"], prices["C"]))
-        print("Coherent: A=%.4f, B=%.4f, C=%.4f" % (result.coherent_prices["A"], result.coherent_prices["B"], result.coherent_prices["C"]))
+        assert result.converged
+
+    def test_implication_violation_detected(self):
+        """Violating B->A (B_yes > A_yes) should have KL > 0."""
+        # B implies A, but B_yes=0.4 > A_yes=0.3 is impossible
+        result = detect_arbitrage_simple(
+            market_prices={"A": [0.3, 0.7], "B": [0.4, 0.6]},
+            implications=[("B", "A")],
+        )
+
+        assert result.kl_divergence > 0.01, f"Expected KL > 0.01, got {result.kl_divergence}"
+        assert result.has_arbitrage()
+
+        # Coherent prices should satisfy implication: A_yes >= B_yes
+        a_yes = result.coherent_market_prices["A"][0]
+        b_yes = result.coherent_market_prices["B"][0]
+        assert a_yes >= b_yes - 0.01, f"Implication violated: A_yes={a_yes} < B_yes={b_yes}"
+
+    def test_implication_satisfied_no_arbitrage(self):
+        """Prices satisfying B->A should have KL ~= 0."""
+        # B implies A, and A_yes=0.6 > B_yes=0.4 - no violation
+        result = detect_arbitrage_simple(
+            market_prices={"A": [0.6, 0.4], "B": [0.4, 0.6]},
+            implications=[("B", "A")],
+        )
+
+        # Should have very low KL (prices are mostly coherent)
+        assert result.kl_divergence < 0.1
+
+    def test_mutex_violation_detected(self):
+        """Mutex markets with high YES probabilities should show arbitrage."""
+        # Both markets have YES probability = 0.6, but they're mutex
+        # This is impossible - at most one can be YES
+        result = detect_arbitrage_simple(
+            market_prices={"A": [0.6, 0.4], "B": [0.6, 0.4]},
+            mutex_pairs=[("A", "B")],
+        )
+
+        assert result.kl_divergence > 0.01
 
 
-class TestHighLevelAPI:
-    """Test the high-level find_arbitrage API."""
-    
-    def test_find_arbitrage_with_graph(self):
-        """Test full pipeline with RelationshipGraph."""
+class TestFindMarginalArbitrage:
+    """Tests for the high-level API."""
+
+    def test_with_relationship_graph(self):
+        """Should work with RelationshipGraph input."""
         graph = RelationshipGraph(
             clusters=[
                 MarketCluster(
@@ -239,253 +275,108 @@ class TestHighLevelAPI:
                     market_ids=["A", "B"],
                     relationships=[
                         MarketRelationship(
-                            type="implies",
-                            from_market="A",
-                            to_market="B",
-                            confidence=1.0,
+                            type=RelationshipType.IMPLIES,
+                            from_market="B",
+                            to_market="A",
                         )
                     ],
                 )
             ]
         )
-        
-        prices = {"A": 0.6, "B": 0.5}
-        
-        result = find_arbitrage(prices, graph)
-        
-        assert result.has_arbitrage
-        assert result.coherent_prices["A"] <= result.coherent_prices["B"] + 1e-4
-    
-    def test_mutual_exclusivity_arbitrage(self):
-        """Test arbitrage from mutual exclusivity violation."""
+
+        # Violating prices
+        result = find_marginal_arbitrage(
+            market_prices={"A": [0.3, 0.7], "B": [0.4, 0.6]},
+            relationships=graph,
+        )
+
+        assert result.has_arbitrage()
+
+    def test_pennsylvania_example(self):
+        """Test the Pennsylvania election example from the plan.
+
+        Market A: "Trump wins PA" (YES/NO)
+        Market B: "Rep wins PA by 5+" (YES/NO)
+        Constraint: B=YES implies A=YES
+
+        If prices are coherent (B_yes < A_yes), KL should be low.
+        """
         graph = RelationshipGraph(
             clusters=[
                 MarketCluster(
-                    cluster_id="test",
-                    market_ids=["A", "B"],
+                    cluster_id="pa_election",
+                    market_ids=["trump_wins_pa", "rep_wins_5plus"],
                     relationships=[
                         MarketRelationship(
-                            type="mutually_exclusive",
-                            from_market="A",
-                            to_market="B",
-                            confidence=1.0,
+                            type=RelationshipType.IMPLIES,
+                            from_market="rep_wins_5plus",
+                            to_market="trump_wins_pa",
                         )
                     ],
                 )
             ]
         )
-        
-        # Violates P(A) + P(B) <= 1
-        prices = {"A": 0.7, "B": 0.6}
-        
-        result = find_arbitrage(prices, graph)
-        
-        assert result.has_arbitrage
-        assert result.coherent_prices["A"] + result.coherent_prices["B"] <= 1.0 + 1e-4
-        
-        print("Original sum: %s" % (prices["A"] + prices["B"]))
-        print("Coherent sum: %.4f" % (result.coherent_prices["A"] + result.coherent_prices["B"]))
+
+        # Coherent prices: Trump=48%, Rep5+=32% (32% < 48%, satisfies implication)
+        result = find_marginal_arbitrage(
+            market_prices={
+                "trump_wins_pa": [0.48, 0.52],
+                "rep_wins_5plus": [0.32, 0.68],
+            },
+            relationships=graph,
+        )
+
+        # Should have low KL (prices are coherent)
+        assert result.kl_divergence < 0.1, f"Expected coherent prices, got KL={result.kl_divergence}"
+
+        # Incoherent prices: Rep5+=60% but Trump=40% (violates implication)
+        result_incoherent = find_marginal_arbitrage(
+            market_prices={
+                "trump_wins_pa": [0.40, 0.60],
+                "rep_wins_5plus": [0.60, 0.40],
+            },
+            relationships=graph,
+        )
+
+        # Should have high KL (arbitrage opportunity)
+        assert result_incoherent.kl_divergence > 0.01
+        assert result_incoherent.has_arbitrage()
 
 
-def run_demo():
-    """Run a demonstration of the optimization engine."""
-    print("=" * 60)
-    print("Optimization Engine Demo")
-    print("=" * 60)
-    
-    # Example: Election market with implication
-    # "Trump wins" implies "Republican wins presidency"
-    print("\n1. Implication Constraint Demo")
-    print("-" * 40)
-    
-    graph = RelationshipGraph(
-        clusters=[
-            MarketCluster(
-                cluster_id="election",
-                market_ids=["trump_wins", "republican_wins"],
-                relationships=[
-                    MarketRelationship(
-                        type="implies",
-                        from_market="trump_wins",
-                        to_market="republican_wins",
-                        confidence=1.0,
-                    )
-                ],
-            )
-        ]
-    )
-    
-    # Arbitrage: Trump winning is priced higher than Republican winning
-    prices = {"trump_wins": 0.45, "republican_wins": 0.40}
-    
-    result = find_arbitrage(prices, graph)
-    
-    print("Market prices: trump_wins=%s, republican_wins=%s" % (prices["trump_wins"], prices["republican_wins"]))
-    print("Constraint: trump_wins implies republican_wins")
-    print("Violation: %s > %s (should be <=)" % (prices["trump_wins"], prices["republican_wins"]))
-    print("\nCoherent prices:")
-    print("  trump_wins: %.4f" % result.coherent_prices["trump_wins"])
-    print("  republican_wins: %.4f" % result.coherent_prices["republican_wins"])
-    print("KL divergence: %.6f" % result.kl_divergence)
-    print("Converged: %s in %d iterations" % (result.converged, result.iterations))
-    
-    # Example 2: Mutually exclusive outcomes
-    print("\n2. Mutual Exclusivity Demo")
-    print("-" * 40)
-    
-    graph2 = RelationshipGraph(
-        clusters=[
-            MarketCluster(
-                cluster_id="winner",
-                market_ids=["candidate_A_wins", "candidate_B_wins"],
-                relationships=[
-                    MarketRelationship(
-                        type="mutually_exclusive",
-                        from_market="candidate_A_wins",
-                        to_market="candidate_B_wins",
-                        confidence=1.0,
-                    )
-                ],
-            )
-        ]
-    )
-    
-    # Arbitrage: Both candidates priced to win with combined prob > 1
-    prices2 = {"candidate_A_wins": 0.55, "candidate_B_wins": 0.55}
-    
-    result2 = find_arbitrage(prices2, graph2)
-    
-    print("Market prices: A_wins=%s, B_wins=%s" % (prices2["candidate_A_wins"], prices2["candidate_B_wins"]))
-    print("Sum: %s > 1.0 (arbitrage!)" % (prices2["candidate_A_wins"] + prices2["candidate_B_wins"]))
-    print("\nCoherent prices:")
-    print("  candidate_A_wins: %.4f" % result2.coherent_prices["candidate_A_wins"])
-    print("  candidate_B_wins: %.4f" % result2.coherent_prices["candidate_B_wins"])
-    print("  Sum: %.4f" % (result2.coherent_prices["candidate_A_wins"] + result2.coherent_prices["candidate_B_wins"]))
-    print("KL divergence: %.6f" % result2.kl_divergence)
-    
-    print("\n" + "=" * 60)
-    print("Demo complete!")
-    print("=" * 60)
+class TestVertexEnumeration:
+    """Tests for vertex enumeration correctness."""
+
+    def test_three_way_implication_chain(self):
+        """C->B->A should have correct vertex count."""
+        # If C=YES then B=YES then A=YES
+        # Valid: (A,B,C) = (Y,Y,Y), (Y,Y,N), (Y,N,N), (N,N,N)
+        # Invalid: Any with C=Y but B=N, or B=Y but A=N
+
+        space = ConditionSpace.from_market_data(["A", "B", "C"])
+        builder = MarginalConstraintBuilder(space)
+        builder.add_implies("C", "B")
+        builder.add_implies("B", "A")
+        constraints = builder.build()
+        lmo = MarginalPolytopeLMO(constraints)
+
+        vertices = lmo.enumerate_vertices(max_vertices=20)
+
+        # Should have exactly 4 valid vertices
+        assert len(vertices) == 4
+
+        # Verify constraints on each vertex
+        a_yes = space.get_yes_index("A")
+        b_yes = space.get_yes_index("B")
+        c_yes = space.get_yes_index("C")
+
+        for v in vertices:
+            # C->B: if C=YES then B=YES
+            if v[c_yes] == 1:
+                assert v[b_yes] == 1
+            # B->A: if B=YES then A=YES
+            if v[b_yes] == 1:
+                assert v[a_yes] == 1
 
 
 if __name__ == "__main__":
-    # Run demo
-    run_demo()
-    
-    # Run tests
-    print("\n\nRunning unit tests...")
     pytest.main([__file__, "-v"])
-
-
-class TestIntegerProgramming:
-    """Test OPT-02 Extension: Integer Programming in LMO."""
-    
-    def test_binary_mode(self):
-        """Test binary IP produces 0/1 solutions."""
-        builder = ConstraintBuilder(["A", "B", "C"])
-        # Sum >= 1 (at least one must be selected)
-        builder._constraints.append((np.array([-1.0, -1.0, -1.0]), -1.0, 'sum_lb'))
-        # Sum <= 1 (at most one can be selected - makes it partition)
-        builder._constraints.append((np.array([1.0, 1.0, 1.0]), 1.0, 'sum_ub'))
-        constraints = builder.build()
-        
-        lmo = LinearMinimizationOracle(constraints, mode="binary")
-        
-        # Gradient favoring A
-        g = np.array([-1.0, 0.0, 0.5])
-        x, _ = lmo.solve(g)
-        
-        # All values should be 0 or 1
-        assert all(v in [0.0, 1.0] for v in x), f"Non-binary solution: {x}"
-        # Should select A (lowest cost)
-        assert x[0] == 1.0
-        assert x[1] == 0.0
-        assert x[2] == 0.0
-    
-    def test_integer_mode_discrete_units(self):
-        """Test integer IP produces discrete solutions."""
-        builder = ConstraintBuilder(["A", "B"])
-        # Sum = 1
-        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
-        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
-        constraints = builder.build()
-        
-        discrete_unit = 0.1
-        lmo = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=discrete_unit)
-        
-        g = np.array([-0.7, 0.3])  # Favor A but not completely
-        x, _ = lmo.solve(g)
-        
-        # All values should be multiples of 0.1
-        for v in x:
-            assert abs(v / discrete_unit - round(v / discrete_unit)) < 1e-6, \
-                f"Value {v} is not a multiple of {discrete_unit}"
-        
-        # Sum should equal 1
-        assert abs(sum(x) - 1.0) < 1e-6
-    
-    def test_solve_discrete_convenience_method(self):
-        """Test solve_discrete temporarily changes mode."""
-        builder = ConstraintBuilder(["A", "B"])
-        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
-        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
-        constraints = builder.build()
-        
-        lmo = LinearMinimizationOracle(constraints)  # Default continuous
-        assert lmo.mode == "continuous"
-        
-        g = np.array([-1.0, 0.0])
-        
-        # Continuous solution
-        x_cont, _ = lmo.solve(g)
-        
-        # Discrete solution via convenience method
-        x_discrete, _ = lmo.solve_discrete(g, mode="binary")
-        
-        # Mode should be restored
-        assert lmo.mode == "continuous"
-        
-        # Binary solution should be 0/1
-        assert all(v in [0.0, 1.0] for v in x_discrete)
-    
-    def test_integer_fallback_to_lp(self):
-        """Test that infeasible integer problems fall back to LP."""
-        builder = ConstraintBuilder(["A"])
-        # Constraint that makes integer infeasible: x = 0.5 exactly
-        builder._constraints.append((np.array([1.0]), 0.5, 'eq_ub'))
-        builder._constraints.append((np.array([-1.0]), -0.5, 'eq_lb'))
-        constraints = builder.build()
-        
-        lmo = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=1.0)
-        
-        g = np.array([1.0])
-        x, _ = lmo.solve(g)  # Should fall back gracefully
-        
-        # Should return a valid solution (fallback)
-        assert len(x) == 1
-    
-    def test_integer_vs_continuous_difference(self):
-        """Test that integer and continuous can produce different results."""
-        builder = ConstraintBuilder(["A", "B"])
-        # Sum = 1
-        builder._constraints.append((np.array([1.0, 1.0]), 1.0, 'sum_ub'))
-        builder._constraints.append((np.array([-1.0, -1.0]), -1.0, 'sum_lb'))
-        # A <= 0.7
-        builder._constraints.append((np.array([1.0, 0.0]), 0.7, 'a_ub'))
-        constraints = builder.build()
-        
-        g = np.array([-1.0, 0.0])  # Minimize -A, i.e., maximize A
-        
-        # Continuous: A should be 0.7 (hits constraint)
-        lmo_cont = LinearMinimizationOracle(constraints, mode="continuous")
-        x_cont, _ = lmo_cont.solve(g)
-        
-        # Integer with unit 0.5: A should be 0.5 (largest multiple of 0.5 <= 0.7)
-        lmo_int = LinearMinimizationOracle(constraints, mode="integer", discrete_unit=0.5)
-        x_int, _ = lmo_int.solve(g)
-        
-        # Verify continuous is 0.7
-        assert abs(x_cont[0] - 0.7) < 1e-6, f"Continuous A = {x_cont[0]}, expected 0.7"
-        
-        # Verify integer is 0.5 (largest discrete value <= 0.7)
-        assert abs(x_int[0] - 0.5) < 1e-6, f"Integer A = {x_int[0]}, expected 0.5"

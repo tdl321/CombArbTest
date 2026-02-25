@@ -14,7 +14,8 @@ from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import Bounds, LinearConstraint, milp
+import gurobipy as gp
+from gurobipy import GRB
 
 from .schema import (
     ConditionSpace,
@@ -225,42 +226,22 @@ class MarginalPolytopeLMO:
 
     Solves: min c^T z subject to z in Z (valid binary joint outcomes)
 
-    Uses scipy.optimize.milp with binary integrality constraints.
+    Uses Gurobi MILP solver with binary integrality constraints.
     """
 
     def __init__(self, constraints: MarginalConstraintMatrix):
         self.constraints = constraints
         self.n = constraints.condition_space.n_conditions()
-
-        # Precompute scipy constraint objects
-        self._bounds = Bounds(lb=np.zeros(self.n), ub=np.ones(self.n))
-        self._integrality = np.ones(self.n, dtype=int)  # All binary
-
-        # Equality constraints: A_eq @ x = b_eq
-        if constraints.A_eq.shape[0] > 0:
-            self._eq_constraint = LinearConstraint(
-                constraints.A_eq,
-                lb=constraints.b_eq,
-                ub=constraints.b_eq,
-            )
-        else:
-            self._eq_constraint = None
-
-        # Inequality constraints: A_ub @ x <= b_ub
-        if constraints.A_ub.shape[0] > 0:
-            self._ub_constraint = LinearConstraint(
-                constraints.A_ub,
-                lb=-np.inf * np.ones(constraints.A_ub.shape[0]),
-                ub=constraints.b_ub,
-            )
-        else:
-            self._ub_constraint = None
-
-        # Cache of found vertices
         self._vertices: list[NDArray] = []
 
+        # Store constraint matrices directly (no scipy objects)
+        self.A_eq = constraints.A_eq
+        self.b_eq = constraints.b_eq
+        self.A_ub = constraints.A_ub
+        self.b_ub = constraints.b_ub
+
     def solve(self, gradient: NDArray) -> tuple[NDArray, float]:
-        """Solve the LMO: find vertex minimizing gradient^T z.
+        """Solve the LMO using Gurobi: find vertex minimizing gradient^T z.
 
         Args:
             gradient: The gradient vector (objective coefficients)
@@ -268,34 +249,43 @@ class MarginalPolytopeLMO:
         Returns:
             Tuple of (vertex z, objective value gradient^T z)
         """
-        # Build constraint list
-        constraints = []
-        if self._eq_constraint is not None:
-            constraints.append(self._eq_constraint)
-        if self._ub_constraint is not None:
-            constraints.append(self._ub_constraint)
+        try:
+            # Create model (suppress output)
+            model = gp.Model("LMO")
+            model.Params.OutputFlag = 0  # Silent
+            model.Params.TimeLimit = 10  # 10 second timeout
 
-        # Solve MILP
-        result = milp(
-            c=gradient,
-            constraints=constraints,
-            integrality=self._integrality,
-            bounds=self._bounds,
-        )
+            # Binary variables: z_i ∈ {0, 1}
+            z = model.addMVar(self.n, vtype=GRB.BINARY, name="z")
 
-        if not result.success:
-            # Fallback: return uniform if no solution found
-            z = np.ones(self.n) / 2
-            return z, gradient @ z
+            # Objective: minimize gradient^T z
+            model.setObjective(gradient @ z, GRB.MINIMIZE)
 
-        # Round to binary (milp should return binary, but ensure it)
-        z = np.round(result.x).astype(float)
-        obj = gradient @ z
+            # Equality constraints: A_eq @ z = b_eq
+            if self.A_eq.shape[0] > 0:
+                model.addMConstr(self.A_eq, z, "=", self.b_eq, name="eq")
 
-        # Cache this vertex
-        self._cache_vertex(z)
+            # Inequality constraints: A_ub @ z <= b_ub
+            if self.A_ub.shape[0] > 0:
+                model.addMConstr(self.A_ub, z, "<", self.b_ub, name="ub")
 
-        return z, obj
+            # Solve
+            model.optimize()
+
+            if model.Status == GRB.OPTIMAL:
+                z_sol = np.array(z.X)
+                obj = model.ObjVal
+                self._cache_vertex(z_sol)
+                return z_sol, obj
+            else:
+                # Fallback: return uniform if no solution
+                z_fallback = np.ones(self.n) / 2
+                return z_fallback, gradient @ z_fallback
+
+        except gp.GurobiError:
+            # License or other Gurobi error - fallback
+            z_fallback = np.ones(self.n) / 2
+            return z_fallback, gradient @ z_fallback
 
     def _cache_vertex(self, z: NDArray) -> None:
         """Cache a vertex if not already seen."""

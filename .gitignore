@@ -30,3 +30,4 @@ Thumbs.db
 *.db
 *.sqlite
 *.log
+.api_venv/

@@ -448,3 +448,220 @@ def build_relationship_graph(markets: list[MarketInfo], client: LLMClient | None
     logger.debug("[CLUSTER] build_relationship_graph called with %d markets", len(markets))
     clusterer = MarketClusterer(client=client)
     return clusterer.cluster_and_extract(markets)
+
+
+# =============================================================================
+# COMPLEX CONSTRAINT PROMPTS (for non-partition logical relationships)
+# =============================================================================
+
+COMPLEX_CONSTRAINTS_SYSTEM = """Identify LOGICAL CONSTRAINTS between prediction markets for combinatorial arbitrage.
+
+## CONSTRAINT TYPES TO DETECT:
+
+### 1. IMPLIES (A → B)
+- If A is true, B must also be true
+- Constraint: P(A) ≤ P(B)
+- Example: "Trump wins presidency" IMPLIES "Trump is inaugurated"
+- Example: "Team wins championship" IMPLIES "Team made playoffs"
+
+### 2. PREREQUISITE (B requires A)
+- B cannot happen without A happening first
+- Constraint: P(B) ≤ P(A)
+- Example: "Bill becomes law" REQUIRES "Bill passes Senate"
+- Example: "Wins finals" REQUIRES "Wins semifinals"
+
+### 3. MUTUALLY_EXCLUSIVE (A XOR B)
+- A and B cannot both be true
+- Constraint: P(A) + P(B) ≤ 1
+- Example: "Trump wins" and "Harris wins" cannot both happen
+
+### 4. INCOMPATIBLE (structural impossibility)
+- Events are structurally impossible together
+- Constraint: P(A) + P(B) ≤ 1
+- Example: Two teams meeting in semifinals cannot BOTH win 6 games
+
+IMPORTANT: Binary Yes/No markets CAN have logical relationships with OTHER markets.
+Focus on cross-market implications, not internal Yes/No structure.
+
+Return high-confidence constraints only. Valid JSON only."""
+
+COMPLEX_CONSTRAINTS_USER = """Identify LOGICAL CONSTRAINTS between these prediction markets.
+
+Theme: {theme}
+
+Markets:
+{markets_json}
+
+Return JSON:
+{{
+    "constraints": [
+        {{
+            "type": "implies|prerequisite|mutually_exclusive|incompatible",
+            "from_market": "market_id",
+            "to_market": "market_id",
+            "confidence": 0.0-1.0,
+            "reasoning": "Why this logical relationship exists"
+        }}
+    ]
+}}
+
+Focus on:
+- Cross-market implications (A winning implies B must also happen)
+- Temporal prerequisites (A must happen before B can happen)
+- Logical impossibilities (A and B cannot both be true)"""
+
+
+class ComplexConstraintExtractor:
+    """Extract complex logical constraints (implies, prerequisite, etc.) between markets.
+    
+    Unlike the partition-focused MarketClusterer, this class extracts constraints
+    that require the Frank-Wolfe solver to evaluate (not simple sum = 1 checks).
+    """
+
+    def __init__(
+        self,
+        client: LLMClient | None = None,
+        temperature: float = 0.2,
+        max_retries: int = 2,
+        min_confidence: float = 0.7,
+    ):
+        self._client = client
+        self.temperature = temperature
+        self.max_retries = max_retries
+        self.min_confidence = min_confidence
+        logger.debug("[COMPLEX] ComplexConstraintExtractor initialized")
+
+    @property
+    def client(self) -> LLMClient:
+        if self._client is None:
+            self._client = get_client()
+        return self._client
+
+    def extract_constraints(
+        self,
+        markets: list[MarketInfo],
+        theme: str = "Related markets",
+    ) -> list[MarketRelationship]:
+        """Extract complex logical constraints from a set of markets.
+        
+        Returns constraints that require the solver (implies, prerequisite, etc.),
+        NOT partition constraints (which can be checked algebraically).
+        """
+        if len(markets) < 2:
+            logger.debug("[COMPLEX] Need at least 2 markets for constraints")
+            return []
+
+        logger.info("[COMPLEX] Extracting complex constraints: %d markets, theme=%s",
+                    len(markets), theme[:40])
+
+        markets_data = [
+            {"id": m.id, "question": m.question, "outcomes": m.outcomes}
+            for m in markets
+        ]
+
+        prompt = COMPLEX_CONSTRAINTS_USER.format(
+            theme=theme,
+            markets_json=json.dumps(markets_data, indent=2),
+        )
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat_json(
+                    prompt=prompt,
+                    system=COMPLEX_CONSTRAINTS_SYSTEM,
+                    temperature=self.temperature,
+                )
+                constraints = self._parse_complex_constraints(response, [m.id for m in markets])
+                logger.info("[COMPLEX] Extracted %d constraints", len(constraints))
+                return constraints
+
+            except Exception as e:
+                logger.warning("[COMPLEX] Attempt %d failed: %s", attempt + 1, e)
+                if attempt == self.max_retries:
+                    logger.error("[COMPLEX] All attempts failed")
+                    return []
+
+        return []
+
+    def _parse_complex_constraints(
+        self,
+        response: dict[str, Any],
+        valid_ids: list[str],
+    ) -> list[MarketRelationship]:
+        """Parse LLM response for complex constraints.
+        
+        Accepts: implies, prerequisite, mutually_exclusive, incompatible, and, or
+        (NOT exhaustive - that is for partitions)
+        """
+        relationships = []
+        valid_set = set(valid_ids)
+
+        # Valid complex constraint types (not partition types)
+        complex_types = {"implies", "prerequisite", "mutually_exclusive", "incompatible", "and", "or"}
+
+        for c in response.get("constraints", []):
+            rel_type = c.get("type", "")
+            from_id = c.get("from_market")
+            to_id = c.get("to_market")
+            confidence = float(c.get("confidence", 0))
+            reasoning = c.get("reasoning", "")
+
+            if rel_type not in complex_types:
+                logger.debug("[COMPLEX] Skipping non-complex type: %s", rel_type)
+                continue
+            if from_id not in valid_set:
+                logger.debug("[COMPLEX] Skipping invalid from_market: %s", from_id)
+                continue
+            if to_id not in valid_set:
+                logger.debug("[COMPLEX] Skipping invalid to_market: %s", to_id)
+                continue
+            if confidence < self.min_confidence:
+                logger.debug("[COMPLEX] Skipping low confidence constraint: %.2f", confidence)
+                continue
+
+            relationships.append(MarketRelationship(
+                type=rel_type,
+                from_market=from_id,
+                to_market=to_id,
+                confidence=confidence,
+                reasoning=reasoning,
+            ))
+            logger.debug("[COMPLEX] Added %s: %s -> %s (conf=%.2f)",
+                        rel_type, from_id, to_id, confidence)
+
+        return relationships
+
+
+def extract_complex_constraints(
+    markets: list[MarketInfo],
+    theme: str = "Related markets",
+    client: LLMClient | None = None,
+) -> RelationshipGraph:
+    """Extract complex logical constraints and build a RelationshipGraph.
+    
+    This is the main entry point for complex constraint extraction.
+    Returns a graph with is_partition=False clusters that require solver evaluation.
+    """
+    logger.info("[COMPLEX] extract_complex_constraints called with %d markets", len(markets))
+
+    extractor = ComplexConstraintExtractor(client=client)
+    constraints = extractor.extract_constraints(markets, theme)
+
+    if not constraints:
+        logger.warning("[COMPLEX] No complex constraints found")
+        return RelationshipGraph(clusters=[])
+
+    # Build a single cluster with all markets and constraints
+    # is_partition=False ensures solver is used (not algebraic check)
+    cluster = MarketCluster(
+        cluster_id="complex-constraints",
+        theme=theme,
+        market_ids=[m.id for m in markets],
+        relationships=constraints,
+        is_partition=False,  # CRITICAL: Forces solver path
+    )
+
+    return RelationshipGraph(
+        clusters=[cluster],
+        model_used=getattr(extractor.client, "model", "unknown"),
+    )

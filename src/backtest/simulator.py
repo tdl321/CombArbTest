@@ -149,8 +149,17 @@ class WalkForwardSimulator:
 
             for cluster in relationship_graph.clusters:
                 # Skip clusters with fewer than 3 markets
-                if not self._should_process_cluster(cluster):
+                # For complex constraints, we allow 2+ markets
+                # Only require 3+ for is_partition=True clusters
+                if getattr(cluster, 'is_partition', False):
+                    if not self._should_process_cluster(cluster):
+                        continue
+                elif len(cluster.market_ids) < 2:
                     continue
+
+                logger.debug("[SIM] Processing cluster: %s (%d markets, is_partition=%s, relationships=%d)",
+                            cluster.cluster_id[:20], len(cluster.market_ids),
+                            getattr(cluster, 'is_partition', False), len(cluster.relationships))
 
                 cluster_prices = {
                     mid: float_prices[mid]
@@ -158,10 +167,13 @@ class WalkForwardSimulator:
                     if mid in float_prices
                 }
 
-                if len(cluster_prices) < MIN_PARTITION_MARKETS:
+                min_markets = MIN_PARTITION_MARKETS if getattr(cluster, 'is_partition', False) else 2
+                if len(cluster_prices) < min_markets:
+                    logger.debug("[SIM] Skipping cluster %s: only %d/%d prices available",
+                                cluster.cluster_id[:12], len(cluster_prices), len(cluster.market_ids))
                     continue
 
-                if not cluster.relationships:
+                if not cluster.relationships and not getattr(cluster, "is_partition", False):
                     continue
 
                 clusters_checked += 1
@@ -272,8 +284,17 @@ class WalkForwardSimulator:
 
             for cluster in relationship_graph.clusters:
                 # Skip clusters with fewer than 3 markets
-                if not self._should_process_cluster(cluster):
+                # For complex constraints, we allow 2+ markets
+                # Only require 3+ for is_partition=True clusters
+                if getattr(cluster, 'is_partition', False):
+                    if not self._should_process_cluster(cluster):
+                        continue
+                elif len(cluster.market_ids) < 2:
                     continue
+
+                logger.debug("[SIM] Processing cluster: %s (%d markets, is_partition=%s, relationships=%d)",
+                            cluster.cluster_id[:20], len(cluster.market_ids),
+                            getattr(cluster, 'is_partition', False), len(cluster.relationships))
 
                 cluster_prices = {
                     mid: float_prices[mid]
@@ -281,10 +302,13 @@ class WalkForwardSimulator:
                     if mid in float_prices
                 }
 
-                if len(cluster_prices) < MIN_PARTITION_MARKETS:
+                min_markets = MIN_PARTITION_MARKETS if getattr(cluster, 'is_partition', False) else 2
+                if len(cluster_prices) < min_markets:
+                    logger.debug("[SIM] Skipping cluster %s: only %d/%d prices available",
+                                cluster.cluster_id[:12], len(cluster_prices), len(cluster.market_ids))
                     continue
 
-                if not cluster.relationships:
+                if not cluster.relationships and not getattr(cluster, "is_partition", False):
                     continue
 
                 cluster_graph = RelationshipGraph(
@@ -435,6 +459,9 @@ class WalkForwardSimulator:
         config: BacktestConfig,
     ) -> Optional[ArbitrageSignal]:
         """Check for arbitrage signal using the Frank-Wolfe solver."""
+        logger.debug("[SIM] SOLVER SIGNAL PATH: cluster=%s (%d markets)",
+                    cluster.cluster_id[:20], len(prices))
+
         result = find_arbitrage(
             market_prices=prices,
             relationships=graph,
@@ -748,12 +775,21 @@ class WalkForwardSimulator:
         REFACTORED: Now uses _extract_arbitrage with ArbitrageExtractor
         for correct profit calculation based on violation magnitude.
         """
+        logger.info("[SIM] SOLVER PATH: Calling Frank-Wolfe for cluster=%s (%d markets)",
+                   cluster.cluster_id[:20], len(prices))
+        logger.debug("[SIM] Solver input prices: %s", {k: f"{v:.4f}" for k, v in prices.items()})
+
         result = find_arbitrage(
             market_prices=prices,
             relationships=graph,
         )
 
+        logger.info("[SIM] SOLVER RESULT: kl=%.6f, converged=%s, iters=%d",
+                   result.kl_divergence, result.converged, result.iterations)
+        logger.debug("[SIM] Coherent prices: %s", {k: f"{v:.4f}" for k, v in result.coherent_prices.items()})
+
         if result.kl_divergence < config.kl_threshold:
+            logger.debug("[SIM] Below threshold: kl=%.6f < %.6f", result.kl_divergence, config.kl_threshold)
             return None
 
         logger.debug(

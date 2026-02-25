@@ -1,314 +1,406 @@
-"""Data loaders for Polymarket parquet files using DuckDB.
+"""Category-aware market and trade loading from parquet files."""
 
-Memory-efficient implementation for 8GB servers.
-"""
+from __future__ import annotations
 
-import json
-import logging
-import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 import duckdb
-import polars as pl
 
-from .models import Market
-
-logger = logging.getLogger(__name__)
+from .category_index import CategoryIndex, CategoryType, SubcategoryType
 
 
-class DataLoader:
-    """Base class for parquet data loading with DuckDB."""
+@dataclass
+class Market:
+    """Basic market information."""
+    id: str
+    question: str
+    slug: str
+    category: str | None = None
+    subcategory: str | None = None
+    volume: float = 0.0
+    liquidity: float = 0.0
+    outcomes: list[str] = field(default_factory=lambda: ["Yes", "No"])
 
-    def __init__(self, data_dir: str | Path, db_path: str | Path | None = None):
-        self.data_dir = Path(data_dir)
+
+@dataclass
+class Trade:
+    """A single trade record."""
+    market_id: str
+    timestamp: datetime
+    price: float
+    size: float
+    side: str  # "buy" or "sell"
+    outcome_index: int = 0
+
+
+class CategoryAwareMarketLoader:
+    """Load markets filtered by LLM-assigned category.
+
+    Combines market parquet files with category index for filtered queries.
+    """
+
+    def __init__(
+        self,
+        markets_dir: str | Path,
+        trades_dir: str | Path | None = None,
+        db_path: str | Path | None = None,
+    ):
+        """Initialize loader with data paths.
+
+        Args:
+            markets_dir: Directory containing market parquet files
+            trades_dir: Directory containing trade parquet files (optional)
+            db_path: Path to DuckDB with market_categories table (optional)
+        """
+        self.markets_dir = Path(markets_dir)
+        self.trades_dir = Path(trades_dir) if trades_dir else None
         self.db_path = Path(db_path) if db_path else None
+
         self._conn: duckdb.DuckDBPyConnection | None = None
-        logger.debug("[DATA] Initializing DataLoader with data_dir=%s", data_dir)
+        self._category_index: CategoryIndex | None = None
+
+        # Cache parquet file lists
+        self._market_files: list[str] | None = None
+        self._trade_files: list[str] | None = None
 
     @property
     def conn(self) -> duckdb.DuckDBPyConnection:
+        """Lazy DuckDB connection for parquet queries."""
         if self._conn is None:
-            logger.debug("[DATA] Creating DuckDB connection")
-            if self.db_path:
-                self._conn = duckdb.connect(str(self.db_path))
-            else:
-                self._conn = duckdb.connect()
-            self._conn.execute("SET enable_progress_bar = false")
-            self._conn.execute("SET memory_limit = '3GB'")
-            logger.debug("[DATA] DuckDB connection established with 3GB memory limit")
+            self._conn = duckdb.connect()
         return self._conn
 
-    def _get_parquet_glob(self, subdir: str) -> str:
-        return str(self.data_dir / subdir / "[!._]*.parquet")
+    @property
+    def category_index(self) -> CategoryIndex | None:
+        """Lazy category index connection."""
+        if self._category_index is None and self.db_path:
+            self._category_index = CategoryIndex(self.db_path)
+        return self._category_index
 
     def close(self) -> None:
+        """Close all connections."""
         if self._conn is not None:
-            logger.debug("[DATA] Closing DuckDB connection")
             self._conn.close()
             self._conn = None
+        if self._category_index is not None:
+            self._category_index.close()
+            self._category_index = None
 
+    def __enter__(self) -> CategoryAwareMarketLoader:
+        return self
 
-class MarketLoader(DataLoader):
-    """Load and query Polymarket market metadata."""
+    def __exit__(self, *args) -> None:
+        self.close()
 
-    def __init__(self, data_dir: str | Path, db_path: str | Path | None = None):
-        super().__init__(data_dir, db_path)
-        self._markets_dir = "markets"
-        logger.debug("[DATA] MarketLoader initialized")
+    @property
+    def market_files(self) -> list[str]:
+        """Get list of market parquet files."""
+        if self._market_files is None:
+            self._market_files = [
+                str(f) for f in self.markets_dir.glob("*.parquet")
+                if not f.name.startswith("._")
+            ]
+        return self._market_files
 
-    def query_markets(
+    @property
+    def trade_files(self) -> list[str]:
+        """Get list of trade parquet files."""
+        if self._trade_files is None and self.trades_dir:
+            self._trade_files = [
+                str(f) for f in self.trades_dir.glob("*.parquet")
+                if not f.name.startswith("._")
+            ]
+        return self._trade_files or []
+
+    def query_by_category(
         self,
-        *,
-        market_ids: list[str] | None = None,
-        min_volume: float | None = None,
-        max_volume: float | None = None,
-        active: bool | None = None,
-        closed: bool | None = None,
-        limit: int | None = None,
-    ) -> pl.DataFrame:
-        logger.debug("[DATA] Querying markets: ids=%s, min_vol=%s, max_vol=%s, active=%s, closed=%s, limit=%s",
-                     len(market_ids) if market_ids else None, min_volume, max_volume, active, closed, limit)
-        start_time = time.time()
-        
-        glob_pattern = self._get_parquet_glob(self._markets_dir)
+        category: CategoryType,
+        subcategory: SubcategoryType | None = None,
+        min_volume: float = 0,
+        limit: int = 1000,
+    ) -> list[Market]:
+        """Get markets in a category with full details.
 
-        conditions = []
-        params = []
+        Args:
+            category: Main category (politics, sports, crypto, etc.)
+            subcategory: Optional subcategory filter
+            min_volume: Minimum volume filter
+            limit: Maximum results
 
-        if market_ids is not None:
-            placeholders = ", ".join(["?" for _ in market_ids])
-            conditions.append("id IN (%s)" % placeholders)
-            params.extend(market_ids)
+        Returns:
+            List of Market objects with category info
+        """
+        if not self.category_index:
+            raise ValueError("Category index not available - provide db_path")
 
-        if min_volume is not None:
-            conditions.append("volume >= ?")
-            params.append(min_volume)
+        # Get market IDs from category index
+        market_ids = self.category_index.query_by_category(
+            category=category,
+            subcategory=subcategory,
+            limit=limit * 2,  # Get extra for volume filter
+        )
 
-        if max_volume is not None:
-            conditions.append("volume <= ?")
-            params.append(max_volume)
+        if not market_ids:
+            return []
 
-        if active is not None:
-            conditions.append("active = ?")
-            params.append(active)
+        # Join with market parquet for full details
+        placeholders = ",".join(f"'{mid}'" for mid in market_ids)
+        query = f"""
+            SELECT
+                m.id,
+                m.question,
+                m.slug,
+                m.volume,
+                m.liquidity
+            FROM read_parquet({self.market_files}) m
+            WHERE m.id IN ({placeholders})
+            {"AND COALESCE(m.volume, 0) >= " + str(min_volume) if min_volume > 0 else ""}
+            ORDER BY COALESCE(m.volume, 0) DESC
+            LIMIT {limit}
+        """
 
-        if closed is not None:
-            conditions.append("closed = ?")
-            params.append(closed)
+        results = self.conn.execute(query).fetchall()
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        limit_clause = "LIMIT %d" % limit if limit else ""
+        # Get categories for results
+        result_ids = [r[0] for r in results]
+        categories = self.category_index.get_categories_batch(result_ids)
 
-        query = """
-            SELECT * FROM read_parquet('%s')
-            WHERE %s
-            ORDER BY volume DESC
-            %s
-        """ % (glob_pattern, where_clause, limit_clause)
+        markets = []
+        for r in results:
+            cat = categories.get(r[0])
+            markets.append(Market(
+                id=r[0],
+                question=r[1] or "",
+                slug=r[2] or "",
+                volume=float(r[3] or 0),
+                liquidity=float(r[4] or 0),
+                category=cat.category if cat else None,
+                subcategory=cat.subcategory if cat else None,
+            ))
 
-        result = self.conn.execute(query, params).pl()
-        elapsed = time.time() - start_time
-        logger.info("[DATA] Query returned %d markets in %.3fs", len(result), elapsed)
-        return result
+        return markets
 
     def get_market(self, market_id: str) -> Market | None:
-        logger.debug("[DATA] Getting market: %s", market_id)
-        df = self.query_markets(market_ids=[market_id], limit=1)
-        if df.is_empty():
-            logger.warning("[DATA] Market not found: %s", market_id)
+        """Get a single market by ID.
+
+        Args:
+            market_id: Market identifier
+
+        Returns:
+            Market object or None if not found
+        """
+        result = self.conn.execute(f"""
+            SELECT id, question, slug, volume, liquidity
+            FROM read_parquet({self.market_files})
+            WHERE id = ?
+            LIMIT 1
+        """, [market_id]).fetchone()
+
+        if result is None:
             return None
-        market = self._row_to_market(df.row(0, named=True))
-        logger.debug("[DATA] Market found: %s (%s)", market_id, market.question[:50])
-        return market
 
-    def _row_to_market(self, row: dict) -> Market:
-        outcomes = json.loads(row["outcomes"]) if row.get("outcomes") else []
-        outcome_prices = json.loads(row["outcome_prices"]) if row.get("outcome_prices") else []
-        clob_token_ids = json.loads(row["clob_token_ids"]) if row.get("clob_token_ids") else None
-
-        if outcome_prices and isinstance(outcome_prices[0], str):
-            outcome_prices = [float(p) for p in outcome_prices]
+        cat = None
+        if self.category_index:
+            cat = self.category_index.get_category(market_id)
 
         return Market(
-            id=row["id"],
-            condition_id=row["condition_id"],
-            question=row["question"],
-            slug=row["slug"],
-            outcomes=outcomes,
-            outcome_prices=outcome_prices,
-            clob_token_ids=clob_token_ids,
-            volume=row.get("volume", 0.0),
-            liquidity=row.get("liquidity", 0.0),
-            active=row.get("active", False),
-            closed=row.get("closed", False),
-            end_date=row.get("end_date"),
-            created_at=row.get("created_at"),
-            market_maker_address=row.get("market_maker_address"),
-            fetched_at=row.get("_fetched_at"),
+            id=result[0],
+            question=result[1] or "",
+            slug=result[2] or "",
+            volume=float(result[3] or 0),
+            liquidity=float(result[4] or 0),
+            category=cat.category if cat else None,
+            subcategory=cat.subcategory if cat else None,
         )
 
+    def get_markets_batch(self, market_ids: list[str]) -> list[Market]:
+        """Get multiple markets by ID.
 
-class BlockLoader(DataLoader):
-    """Load block number to timestamp mappings.
-    
-    Uses on-demand queries instead of loading all blocks into memory.
-    """
+        Args:
+            market_ids: List of market identifiers
 
-    def __init__(self, data_dir: str | Path, db_path: str | Path | None = None):
-        super().__init__(data_dir, db_path)
-        self._blocks_dir = "blocks"
-        self._view_created = False
-        logger.debug("[DATA] BlockLoader initialized")
+        Returns:
+            List of Market objects (only found markets)
+        """
+        if not market_ids:
+            return []
 
-    def _ensure_view(self) -> None:
-        if self._view_created:
-            return
-        logger.debug("[DATA] Creating blocks view")
-        glob_pattern = self._get_parquet_glob(self._blocks_dir)
-        self.conn.execute("""
-            CREATE OR REPLACE VIEW blocks AS
-            SELECT * FROM read_parquet('%s')
-        """ % glob_pattern)
-        self._view_created = True
-        logger.debug("[DATA] Blocks view created")
+        placeholders = ",".join(f"'{mid}'" for mid in market_ids)
+        results = self.conn.execute(f"""
+            SELECT id, question, slug, volume, liquidity
+            FROM read_parquet({self.market_files})
+            WHERE id IN ({placeholders})
+        """).fetchall()
 
-    def get_timestamp(self, block_number: int) -> datetime | None:
-        """Get timestamp for a specific block number."""
-        logger.debug("[DATA] Getting timestamp for block %d", block_number)
-        self._ensure_view()
-        result = self.conn.execute(
-            "SELECT timestamp FROM blocks WHERE block_number = ?",
-            [block_number]
-        ).fetchone()
-        if result is None:
-            logger.warning("[DATA] Block not found: %d", block_number)
-            return None
-        ts_str = result[0]
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        categories = {}
+        if self.category_index:
+            categories = self.category_index.get_categories_batch(market_ids)
 
-    def get_timestamps_batch(self, block_numbers: list[int]) -> dict[int, datetime]:
-        """Get timestamps for multiple block numbers efficiently."""
-        if not block_numbers:
-            return {}
-        
-        logger.debug("[DATA] Getting timestamps for %d blocks", len(block_numbers))
-        start_time = time.time()
-        
-        self._ensure_view()
-        placeholders = ", ".join(["?" for _ in block_numbers])
-        result = self.conn.execute(
-            "SELECT block_number, timestamp FROM blocks WHERE block_number IN (%s)" % placeholders,
-            block_numbers
-        ).fetchall()
-        
-        timestamps = {}
-        for bn, ts_str in result:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            timestamps[bn] = ts
-        
-        elapsed = time.time() - start_time
-        logger.debug("[DATA] Retrieved %d timestamps in %.3fs", len(timestamps), elapsed)
-        return timestamps
+        markets = []
+        for r in results:
+            cat = categories.get(r[0])
+            markets.append(Market(
+                id=r[0],
+                question=r[1] or "",
+                slug=r[2] or "",
+                volume=float(r[3] or 0),
+                liquidity=float(r[4] or 0),
+                category=cat.category if cat else None,
+                subcategory=cat.subcategory if cat else None,
+            ))
 
+        return markets
 
-class TradeLoader(DataLoader):
-    """Load and query Polymarket trade data."""
-
-    def __init__(self, data_dir: str | Path, db_path: str | Path | None = None, block_loader: BlockLoader | None = None):
-        super().__init__(data_dir, db_path)
-        self._trades_dir = "trades"
-        self.block_loader = block_loader or BlockLoader(data_dir, db_path)
-        self._view_created = False
-        logger.debug("[DATA] TradeLoader initialized")
-
-    def _ensure_view(self) -> None:
-        if self._view_created:
-            return
-        logger.debug("[DATA] Creating trades view")
-        glob_pattern = self._get_parquet_glob(self._trades_dir)
-        self.conn.execute("""
-            CREATE OR REPLACE VIEW trades AS
-            SELECT * FROM read_parquet('%s')
-        """ % glob_pattern)
-        self._view_created = True
-        logger.debug("[DATA] Trades view created")
-
-    def query_trades(
+    def get_trades(
         self,
-        *,
-        asset_ids: list[str] | None = None,
-        min_block: int | None = None,
-        max_block: int | None = None,
-        limit: int | None = 10000,
-    ) -> pl.DataFrame:
-        """Query trades with filters."""
-        logger.debug("[DATA] Querying trades: assets=%s, min_block=%s, max_block=%s, limit=%s",
-                     len(asset_ids) if asset_ids else None, min_block, max_block, limit)
-        start_time = time.time()
-        
-        self._ensure_view()
+        market_ids: list[str],
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 100000,
+    ) -> list[Trade]:
+        """Get trades for specific markets.
 
-        conditions = []
-        params = []
+        Args:
+            market_ids: Market IDs to get trades for
+            start_time: Optional start time filter
+            end_time: Optional end time filter
+            limit: Maximum trades to return
 
-        if asset_ids is not None:
-            placeholders = ", ".join(["?" for _ in asset_ids])
-            conditions.append("(maker_asset_id IN (%s) OR taker_asset_id IN (%s))" % (placeholders, placeholders))
-            params.extend(asset_ids)
-            params.extend(asset_ids)
+        Returns:
+            List of Trade objects sorted by timestamp
+        """
+        if not self.trade_files:
+            raise ValueError("Trade directory not configured")
 
-        if min_block is not None:
-            conditions.append("block_number >= ?")
-            params.append(min_block)
+        if not market_ids:
+            return []
 
-        if max_block is not None:
-            conditions.append("block_number < ?")
-            params.append(max_block)
+        placeholders = ",".join(f"'{mid}'" for mid in market_ids)
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        limit_clause = "LIMIT %d" % limit if limit else ""
+        time_filter = ""
+        if start_time:
+            time_filter += f" AND timestamp >= '{start_time.isoformat()}'"
+        if end_time:
+            time_filter += f" AND timestamp <= '{end_time.isoformat()}'"
 
-        query = """
-            SELECT * FROM trades
-            WHERE %s
-            ORDER BY block_number ASC
-            %s
-        """ % (where_clause, limit_clause)
+        query = f"""
+            SELECT
+                market_id,
+                timestamp,
+                price,
+                size,
+                side,
+                outcome_index
+            FROM read_parquet({self.trade_files})
+            WHERE market_id IN ({placeholders})
+            {time_filter}
+            ORDER BY timestamp
+            LIMIT {limit}
+        """
 
-        result = self.conn.execute(query, params).pl()
-        elapsed = time.time() - start_time
-        logger.info("[DATA] Query returned %d trades in %.3fs", len(result), elapsed)
-        return result
+        results = self.conn.execute(query).fetchall()
 
-    def get_trades_for_market(
+        return [
+            Trade(
+                market_id=r[0],
+                timestamp=r[1],
+                price=float(r[2]),
+                size=float(r[3]),
+                side=r[4] or "buy",
+                outcome_index=int(r[5] or 0),
+            )
+            for r in results
+        ]
+
+    def stream_trades(
         self,
-        clob_token_ids: list[str],
-        min_block: int | None = None,
-        max_block: int | None = None,
-        limit: int | None = 10000,
-    ) -> pl.DataFrame:
-        """Get trades for a market by its CLOB token IDs."""
-        logger.debug("[DATA] Getting trades for market with %d token IDs", len(clob_token_ids))
-        return self.query_trades(
-            asset_ids=clob_token_ids,
-            min_block=min_block,
-            max_block=max_block,
-            limit=limit,
-        )
+        market_ids: list[str],
+        batch_size: int = 10000,
+    ) -> Iterator[list[Trade]]:
+        """Stream trades in batches for large datasets.
 
-    def enrich_with_timestamps(self, trades_df: pl.DataFrame) -> pl.DataFrame:
-        """Add timestamps to trades using block loader."""
-        if trades_df.is_empty():
-            return trades_df.with_columns(pl.lit(None).alias("block_timestamp"))
+        Args:
+            market_ids: Market IDs to get trades for
+            batch_size: Number of trades per batch
 
-        logger.debug("[DATA] Enriching %d trades with timestamps", len(trades_df))
-        block_numbers = trades_df["block_number"].unique().to_list()
-        timestamps = self.block_loader.get_timestamps_batch(block_numbers)
-        
-        return trades_df.with_columns(
-            pl.col("block_number").map_elements(
-                lambda bn: timestamps.get(bn),
-                return_dtype=pl.Datetime("us", "UTC")
-            ).alias("block_timestamp")
-        )
+        Yields:
+            Batches of Trade objects
+        """
+        if not self.trade_files:
+            raise ValueError("Trade directory not configured")
+
+        if not market_ids:
+            return
+
+        placeholders = ",".join(f"'{mid}'" for mid in market_ids)
+
+        query = f"""
+            SELECT
+                market_id,
+                timestamp,
+                price,
+                size,
+                side,
+                outcome_index
+            FROM read_parquet({self.trade_files})
+            WHERE market_id IN ({placeholders})
+            ORDER BY timestamp
+        """
+
+        # Use DuckDB's fetch_many for streaming
+        result = self.conn.execute(query)
+
+        while True:
+            batch = result.fetchmany(batch_size)
+            if not batch:
+                break
+
+            trades = [
+                Trade(
+                    market_id=r[0],
+                    timestamp=r[1],
+                    price=float(r[2]),
+                    size=float(r[3]),
+                    side=r[4] or "buy",
+                    outcome_index=int(r[5] or 0),
+                )
+                for r in batch
+            ]
+            yield trades
+
+    def get_all_market_ids(self) -> list[str]:
+        """Get all market IDs from parquet files.
+
+        Returns:
+            List of all market IDs
+        """
+        results = self.conn.execute(f"""
+            SELECT DISTINCT id FROM read_parquet({self.market_files})
+        """).fetchall()
+        return [r[0] for r in results]
+
+    def count_markets(self) -> int:
+        """Get total number of markets."""
+        return self.conn.execute(f"""
+            SELECT COUNT(*) FROM read_parquet({self.market_files})
+        """).fetchone()[0]
+
+    def category_summary(self) -> dict[str, dict]:
+        """Get summary statistics by category.
+
+        Returns:
+            Dict with category stats including count, volume, etc.
+        """
+        if not self.category_index:
+            raise ValueError("Category index not available")
+
+        counts = self.category_index.count_by_category()
+        total = self.category_index.total_categorized()
+
+        return {
+            "total_categorized": total,
+            "by_category": counts,
+        }
