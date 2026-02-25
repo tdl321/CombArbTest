@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -201,6 +201,14 @@ class OptimizationConfig(BaseModel):
     epsilon_init: float = 0.1  # Initial barrier contraction
     epsilon_min: float = 0.001  # Minimum barrier contraction
     epsilon_decay: float = 0.9  # Decay rate per iteration
+
+    # Step size configuration
+    step_mode: Literal["adaptive", "line_search", "fixed"] = "line_search"
+    smoothness_alpha: float = 0.1  # EMA decay for smoothness estimation
+    initial_smoothness: float = 1.0  # Initial L estimate for adaptive mode
+    min_smoothness: float = 1e-6  # Minimum L to prevent division by zero
+    fixed_step_size: float = 0.5  # Step size for fixed mode
+
     # Backward compatibility aliases
     initial_barrier: float = 0.1
     min_barrier: float = 0.001

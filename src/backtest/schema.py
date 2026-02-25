@@ -130,6 +130,7 @@ class BacktestConfig(BaseModel):
     max_ticks: Optional[int] = None  # Stop after N ticks (for testing)
     store_all_opportunities: bool = True  # Store full opportunity list in report
     signal_only: bool = False  # If True, skip PnL calculation
+    solver_mode: str = "adaptive"  # "adaptive", "line_search", or "fixed"
     
     def __init__(self, **data):
         super().__init__(**data)

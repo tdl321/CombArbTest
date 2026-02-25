@@ -32,6 +32,66 @@ from .schema import (
 )
 
 
+# =============================================================================
+# Adaptive Step Size Functions
+# =============================================================================
+
+
+def compute_adaptive_step(
+    gap: float,
+    direction: NDArray,
+    L_est: float,
+    L_min: float = 1e-6,
+) -> float:
+    """Compute adaptive Frank-Wolfe step size.
+
+    Uses the short-step rule with estimated local smoothness:
+    γ = min(1, gap / (L * ||d||²))
+
+    Args:
+        gap: Duality gap (gradient^T (x - z))
+        direction: Update direction (z - x)
+        L_est: Estimated local Lipschitz constant
+        L_min: Minimum smoothness to prevent division by zero
+
+    Returns:
+        Step size gamma in [0, 1]
+    """
+    d_norm_sq = np.dot(direction, direction)
+    if d_norm_sq < 1e-12:
+        return 0.0
+
+    L_safe = max(L_est, L_min)
+    gamma = gap / (L_safe * d_norm_sq)
+    return min(1.0, max(0.0, gamma))
+
+
+def estimate_smoothness(
+    grad_new: NDArray,
+    grad_old: NDArray,
+    x_new: NDArray,
+    x_old: NDArray,
+) -> float:
+    """Estimate local Lipschitz constant from gradient change.
+
+    L_k = ||∇f(x_{k+1}) - ∇f(x_k)|| / ||x_{k+1} - x_k||
+
+    Args:
+        grad_new: Gradient at new point
+        grad_old: Gradient at old point
+        x_new: New point
+        x_old: Old point
+
+    Returns:
+        Estimated local smoothness constant (inf if denominator is zero)
+    """
+    grad_diff = np.linalg.norm(grad_new - grad_old)
+    x_diff = np.linalg.norm(x_new - x_old)
+    if x_diff < 1e-12:
+        return float("inf")
+    return grad_diff / x_diff
+
+
 def marginal_frank_wolfe(
     market_prices: dict[str, list[float]],
     constraints: MarginalConstraintMatrix,
@@ -74,6 +134,12 @@ def marginal_frank_wolfe(
     gap = float("inf")
     active_vertices: list[NDArray] = []
 
+    # Adaptive step size state
+    L_est = config.initial_smoothness
+    alpha = config.smoothness_alpha
+    grad_old: NDArray | None = None
+    mu_old: NDArray | None = None
+
     for t in range(config.max_iterations):
         iterations = t + 1
 
@@ -94,10 +160,29 @@ def marginal_frank_wolfe(
         # Direction: vertex - current
         direction = z_new - mu_interior
 
-        # Line search for optimal step size
-        gamma = line_search_exact(
-            theta, mu_interior, direction, space, max_gamma=1.0
-        )
+        # Compute step size based on mode
+        if config.step_mode == "adaptive":
+            # Update smoothness estimate from previous iteration
+            if grad_old is not None and mu_old is not None:
+                L_k = estimate_smoothness(gradient, grad_old, mu_interior, mu_old)
+                if L_k < float("inf"):
+                    L_est = alpha * L_k + (1 - alpha) * L_est
+
+            gamma = compute_adaptive_step(
+                gap, direction, L_est, config.min_smoothness
+            )
+
+            # Store for next iteration
+            grad_old = gradient.copy()
+            mu_old = mu_interior.copy()
+
+        elif config.step_mode == "fixed":
+            gamma = config.fixed_step_size
+        else:
+            # Default: line search
+            gamma = line_search_exact(
+                theta, mu_interior, direction, space, max_gamma=1.0
+            )
 
         # Update
         mu_interior = mu_interior + gamma * direction

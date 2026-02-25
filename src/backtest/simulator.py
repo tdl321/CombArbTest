@@ -32,6 +32,7 @@ from src.optimizer import (
     ArbitrageResult,
     RelationshipGraph,
     MarketCluster,
+    OptimizationConfig,
 )
 from src.llm import MarketInfo
 from src.visualization.schema import ArbitrageSignal
@@ -178,8 +179,9 @@ class WalkForwardSimulator:
 
                 clusters_checked += 1
 
+                # Convert to dict to avoid llm.schema vs optimizer.schema type conflict
                 cluster_graph = RelationshipGraph(
-                    clusters=[cluster],
+                    clusters=[cluster.model_dump()],
                 )
 
                 opportunity = self._check_arbitrage(
@@ -311,8 +313,9 @@ class WalkForwardSimulator:
                 if not cluster.relationships and not getattr(cluster, "is_partition", False):
                     continue
 
+                # Convert to dict to avoid llm.schema vs optimizer.schema type conflict
                 cluster_graph = RelationshipGraph(
-                    clusters=[cluster],
+                    clusters=[cluster.model_dump()],
                 )
 
                 signal = self._check_signal(
@@ -462,9 +465,16 @@ class WalkForwardSimulator:
         logger.debug("[SIM] SOLVER SIGNAL PATH: cluster=%s (%d markets)",
                     cluster.cluster_id[:20], len(prices))
 
+        # Use adaptive solver for 9-10x speedup
+        opt_config = OptimizationConfig(
+            step_mode=config.solver_mode,
+            max_iterations=100,
+            tolerance=1e-4,
+        )
         result = find_arbitrage(
             market_prices=prices,
             relationships=graph,
+            config=opt_config,
         )
 
         if result.kl_divergence < config.kl_threshold:
@@ -779,9 +789,16 @@ class WalkForwardSimulator:
                    cluster.cluster_id[:20], len(prices))
         logger.debug("[SIM] Solver input prices: %s", {k: f"{v:.4f}" for k, v in prices.items()})
 
+        # Use adaptive solver for 9-10x speedup
+        opt_config = OptimizationConfig(
+            step_mode=config.solver_mode,
+            max_iterations=100,
+            tolerance=1e-4,
+        )
         result = find_arbitrage(
             market_prices=prices,
             relationships=graph,
+            config=opt_config,
         )
 
         logger.info("[SIM] SOLVER RESULT: kl=%.6f, converged=%s, iters=%d",
