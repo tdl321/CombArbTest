@@ -43,12 +43,11 @@ def categorical_kl(
         theta_m = theta[indices]
         mu_m = mu[indices]
 
-        # Normalize to ensure valid distributions
+        # Clip for numerical stability (no normalization - caller must ensure valid distributions)
+        # NOTE: Normalization was removed to align the objective with its gradient.
+        # The FW algorithm guarantees mu stays on the simplex via convex combinations of vertices.
         theta_m = np.clip(theta_m, eps, 1.0 - eps)
         mu_m = np.clip(mu_m, eps, 1.0 - eps)
-
-        theta_m = theta_m / theta_m.sum()
-        mu_m = mu_m / mu_m.sum()
 
         # KL divergence for this market
         kl_m = np.sum(theta_m * np.log(theta_m / mu_m))
