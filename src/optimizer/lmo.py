@@ -164,20 +164,60 @@ class MarginalConstraintBuilder:
     def add_relationship(self, rel: MarketRelationship) -> MarginalConstraintBuilder:
         """Add a relationship from the relationship graph.
 
+        Handles all known relationship types including prerequisite,
+        exhaustive, incompatible, and, or.
+
         Args:
             rel: MarketRelationship to add
 
         Returns:
             self for chaining
         """
-        if rel.type == RelationshipType.IMPLIES:
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        rel_type = rel.type.lower() if isinstance(rel.type, str) else rel.type.value
+
+        if rel_type == RelationshipType.IMPLIES or rel_type == "implies":
             self.add_implies(rel.from_market, rel.to_market)
-        elif rel.type == RelationshipType.MUTUALLY_EXCLUSIVE:
+        elif rel_type == RelationshipType.MUTUALLY_EXCLUSIVE or rel_type == "mutually_exclusive":
             self.add_mutually_exclusive(rel.from_market, rel.to_market)
-        elif rel.type == RelationshipType.EQUIVALENT:
+        elif rel_type == RelationshipType.EQUIVALENT or rel_type == "equivalent":
             self.add_equivalent(rel.from_market, rel.to_market)
-        elif rel.type == RelationshipType.OPPOSITE:
+        elif rel_type == RelationshipType.OPPOSITE or rel_type == "opposite":
             self.add_opposite(rel.from_market, rel.to_market)
+        elif rel_type == "prerequisite":
+            # Prerequisite: to_market requires from_market (from implies to)
+            # P(to) <= P(from) — same as implies
+            self.add_implies(rel.from_market, rel.to_market)
+        elif rel_type == "incompatible":
+            # Incompatible: same as mutually exclusive — P(A) + P(B) <= 1
+            self.add_mutually_exclusive(rel.from_market, rel.to_market)
+        elif rel_type == "exhaustive":
+            # Exhaustive: at least one must be true
+            # For N markets: sum(z_yes_i) >= 1, or -sum(z_yes_i) <= -1
+            # This is a unary constraint on a set of markets, handled at partition level
+            # The partition checker already handles this algebraically
+            _logger.debug("[LMO] Exhaustive constraint noted (handled at partition level)")
+        elif rel_type == "and":
+            # AND: joint constraint P(A and B)
+            # For binary markets: z_A_yes = 1 AND z_B_yes = 1 is a valid vertex
+            # Constraint: z_A_yes >= z_B_yes and z_B_yes >= z_A_yes (equivalent)
+            if rel.from_market and rel.to_market:
+                self.add_equivalent(rel.from_market, rel.to_market)
+        elif rel_type == "or":
+            # OR: at least one must be true
+            # Constraint: z_A_yes + z_B_yes >= 1, or -z_A_yes - z_B_yes <= -1
+            if rel.from_market and rel.to_market:
+                a_yes_idx = self.condition_space.get_yes_index(rel.from_market)
+                b_yes_idx = self.condition_space.get_yes_index(rel.to_market)
+                row = np.zeros(self.n)
+                row[a_yes_idx] = -1.0
+                row[b_yes_idx] = -1.0
+                self._ub_rows.append(row)
+                self._ub_rhs.append(-1.0)
+        else:
+            _logger.warning("[LMO] Unknown relationship type: %s", rel_type)
 
         return self
 
