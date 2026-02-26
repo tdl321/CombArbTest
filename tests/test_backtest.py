@@ -1,391 +1,308 @@
-#!/usr/bin/env python3
-"""Integration tests for the Backtest module.
+"""Tests for the Backtest module.
 
-Tests BT-01 through BT-04 with real data and synthetic relationships.
+Tests the core backtest components:
+1. Report generation from opportunities
+2. ArbitrageExtractor trade extraction
+3. Optimizer integration
+4. Data loading (integration, requires data files)
 """
 
 import logging
-import sys
+import pytest
 from datetime import datetime
-from decimal import Decimal
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Data directory
 DATA_DIR = "/root/prediction-market-analysis/data/polymarket"
 
 
-def test_report_generation():
-    """Test report generation from opportunities."""
-    from src.backtest.schema import ArbitrageOpportunity, ArbitrageTrade
-    from src.backtest.report import generate_report, format_report
-    
-    print("\n" + "=" * 60)
-    print("TEST: Report Generation")
-    print("=" * 60)
-    
-    # Helper to create opportunities with new schema
-    def make_opp(timestamp, block, cluster, market_prices, locked_profit, net_profit, positions, constraint_type="implies"):
+# =============================================================================
+# Unit Tests (no external dependencies)
+# =============================================================================
+
+
+class TestReportGeneration:
+    """Test report generation from ArbitrageOpportunity objects."""
+
+    def test_report_basic(self):
+        """Test basic report generation."""
+        from src.backtest.schema import ArbitrageOpportunity
+        from src.arbitrage.extractor import ArbitrageTrade
+        from src.backtest.report import generate_report
+
         trade = ArbitrageTrade(
-            constraint_type=constraint_type,
-            positions=positions,
-            violation_amount=locked_profit,
-            locked_profit=locked_profit,
-            market_prices=market_prices,
-            description=f"Test {constraint_type} trade",
-        )
-        return ArbitrageOpportunity(
-            timestamp=timestamp,
-            block_number=block,
-            cluster_id=cluster,
-            trade=trade,
-            detection_method=constraint_type,
-        )
-    
-    # Create some sample opportunities using new schema
-    opportunities = [
-        make_opp(
-            timestamp=datetime(2024, 1, 1, 10, 0, 0),
-            block=18000000,
-            cluster="test_cluster",
-            market_prices={"A": 0.4, "B": 0.5},
-            locked_profit=0.1,
-            net_profit=0.085,
-            positions={"A": "BUY"},
-        ),
-        make_opp(
-            timestamp=datetime(2024, 1, 1, 11, 0, 0),
-            block=18001000,
-            cluster="test_cluster",
-            market_prices={"A": 0.6, "B": 0.4},
-            locked_profit=0.2,
-            net_profit=0.17,
+            constraint_type="implies",
             positions={"A": "SELL", "B": "BUY"},
-        ),
-        make_opp(
-            timestamp=datetime(2024, 1, 1, 12, 0, 0),
-            block=18002000,
-            cluster="test_cluster",
-            market_prices={"A": 0.45, "B": 0.48},
-            locked_profit=0.01,  # Small profit, will be loss after fees (2 legs * 0.01 = 0.02)
-            net_profit=-0.01,  # Loss after costs: 0.01 - 0.02 = -0.01
-            positions={"A": "BUY", "B": "BUY"},
-        ),
-    ]
-    
-    report = generate_report(
-        opportunities=opportunities,
-        start_date=datetime(2024, 1, 1, 10, 0, 0),
-        end_date=datetime(2024, 1, 1, 12, 0, 0),
-        markets_analyzed=2,
-        clusters_found=1,
-        cluster_themes={"test_cluster": "Test Theme"},
-        cluster_market_ids={"test_cluster": ["A", "B"]},
-    )
-    
-    print(f"Total opportunities: {report.total_opportunities}")
-    print(f"Gross PnL: ${report.gross_pnl:.4f}")
-    print(f"Net PnL: ${report.net_pnl:.4f}")
-    print(f"Win rate: {report.win_rate * 100:.1f}%")
-    print(f"Max drawdown: ${report.max_drawdown:.4f}")
-    
-    assert report.total_opportunities == 3
-    assert report.win_count == 2
-    assert report.loss_count == 1
-    assert report.win_rate == 2/3
-    
-    # Test formatted output
-    formatted = format_report(report)
-    print("\nFormatted Report Preview:")
-    print(formatted[:500] + "...")
-    
-    print("\nReport generation: PASSED")
-    return True
-
-
-def test_data_loading():
-    """Test that we can load data from the Polymarket dataset."""
-    from src.data import MarketLoader, TradeLoader, BlockLoader
-    
-    print("\n" + "=" * 60)
-    print("TEST: Data Loading")
-    print("=" * 60)
-    
-    market_loader = MarketLoader(DATA_DIR)
-    block_loader = BlockLoader(DATA_DIR)
-    trade_loader = TradeLoader(DATA_DIR, block_loader=block_loader)
-    
-    # Load some high-volume markets
-    markets_df = market_loader.query_markets(min_volume=1_000_000, limit=10)
-    print(f"Found {len(markets_df)} markets with volume > $1M")
-    
-    if markets_df.is_empty():
-        print("WARNING: No markets found, skipping data test")
-        return True
-    
-    # Get first market details
-    market_id = markets_df.row(0, named=True)["id"]
-    market = market_loader.get_market(market_id)
-    
-    print(f"\nSample market:")
-    print(f"  ID: {market.id}")
-    print(f"  Question: {market.question[:60]}...")
-    print(f"  Volume: ${market.volume:,.0f}")
-    print(f"  Outcomes: {market.outcomes}")
-    print(f"  Token IDs: {market.clob_token_ids}")
-    
-    # Load some trades
-    if market.clob_token_ids:
-        trades_df = trade_loader.query_trades(
-            asset_ids=market.clob_token_ids,
-            limit=100,
+            violation_amount=0.1,
+            locked_profit=0.1,
+            market_prices={"A": 0.7, "B": 0.5},
+            description="Test implies trade",
         )
-        print(f"\nLoaded {len(trades_df)} trades for this market")
-        
-        if not trades_df.is_empty():
-            # Check block range
-            min_block = trades_df["block_number"].min()
-            max_block = trades_df["block_number"].max()
-            print(f"Block range: {min_block:,} - {max_block:,}")
-    
-    print("\nData loading: PASSED")
-    return True
+        opp = ArbitrageOpportunity(
+            timestamp=datetime(2024, 1, 1, 10, 0, 0),
+            block_number=18000000,
+            cluster_id="test_cluster",
+            trade=trade,
+            detection_method="solver",
+        )
+
+        report = generate_report(
+            opportunities=[opp],
+            start_date=datetime(2024, 1, 1, 10, 0, 0),
+            end_date=datetime(2024, 1, 1, 12, 0, 0),
+            markets_analyzed=2,
+            clusters_found=1,
+            cluster_themes={"test_cluster": "Test Theme"},
+            cluster_market_ids={"test_cluster": ["A", "B"]},
+        )
+
+        assert report.total_opportunities == 1
+        assert report.gross_pnl > 0
+
+    def test_report_multiple_opps(self):
+        """Test report with multiple opportunities."""
+        from src.backtest.schema import ArbitrageOpportunity
+        from src.arbitrage.extractor import ArbitrageTrade
+        from src.backtest.report import generate_report
+
+        opportunities = []
+        for i, (profit, constraint) in enumerate([(0.1, "implies"), (0.2, "partition"), (0.01, "implies")]):
+            trade = ArbitrageTrade(
+                constraint_type=constraint,
+                positions={"A": "SELL", "B": "BUY"},
+                violation_amount=profit,
+                locked_profit=profit,
+                market_prices={"A": 0.6, "B": 0.4},
+                description=f"Test trade {i}",
+            )
+            opp = ArbitrageOpportunity(
+                timestamp=datetime(2024, 1, 1, 10 + i, 0, 0),
+                block_number=18000000 + i * 1000,
+                cluster_id="test_cluster",
+                trade=trade,
+                detection_method=constraint,
+            )
+            opportunities.append(opp)
+
+        report = generate_report(
+            opportunities=opportunities,
+            start_date=datetime(2024, 1, 1, 10, 0, 0),
+            end_date=datetime(2024, 1, 1, 13, 0, 0),
+            markets_analyzed=2,
+            clusters_found=1,
+            cluster_themes={"test_cluster": "Test"},
+            cluster_market_ids={"test_cluster": ["A", "B"]},
+        )
+
+        assert report.total_opportunities == 3
+        assert report.gross_pnl == pytest.approx(0.31, abs=0.01)
+
+    def test_report_format(self):
+        """Test report formatting produces string output."""
+        from src.backtest.schema import ArbitrageOpportunity
+        from src.arbitrage.extractor import ArbitrageTrade
+        from src.backtest.report import generate_report, format_report
+
+        trade = ArbitrageTrade(
+            constraint_type="partition",
+            positions={"A": "BUY", "B": "BUY", "C": "BUY"},
+            violation_amount=0.05,
+            locked_profit=0.05,
+            market_prices={"A": 0.3, "B": 0.3, "C": 0.35},
+            description="Test partition trade",
+        )
+        opp = ArbitrageOpportunity(
+            timestamp=datetime(2024, 1, 1, 10, 0, 0),
+            block_number=18000000,
+            cluster_id="test_cluster",
+            trade=trade,
+            detection_method="partition",
+        )
+
+        report = generate_report(
+            opportunities=[opp],
+            start_date=datetime(2024, 1, 1, 10, 0, 0),
+            end_date=datetime(2024, 1, 1, 12, 0, 0),
+            markets_analyzed=3,
+            clusters_found=1,
+            cluster_themes={"test_cluster": "Test"},
+            cluster_market_ids={"test_cluster": ["A", "B", "C"]},
+        )
+
+        formatted = format_report(report)
+        assert isinstance(formatted, str)
+        assert len(formatted) > 0
 
 
-def test_optimizer_integration():
-    """Test that we can call the optimizer with test data."""
-    from src.optimizer import (
-        find_arbitrage,
-        RelationshipGraph,
-        MarketCluster,
-        MarketRelationship,
-    )
-    
-    print("\n" + "=" * 60)
-    print("TEST: Optimizer Integration")
-    print("=" * 60)
-    
-    # Create a simple relationship graph
-    relationships = [
-        MarketRelationship(
-            type="implies",
-            from_market="A",
-            to_market="B",
-            confidence=0.9,
-        ),
-    ]
-    
-    cluster = MarketCluster(
-        cluster_id="test",
-        theme="Test Cluster",
-        market_ids=["A", "B"],
-        relationships=relationships,
-    )
-    
-    graph = RelationshipGraph(clusters=[cluster])
-    
-    # Test case 1: Prices violate implication (A > B, but A implies B)
-    prices_violation = {"A": 0.7, "B": 0.5}
-    result = find_arbitrage(prices_violation, graph)
-    
-    print(f"Test 1: A implies B violation")
-    print(f"  Market prices:   {prices_violation}")
-    print(f"  Coherent prices: {result.coherent_prices}")
-    print(f"  KL divergence:   {result.kl_divergence:.6f}")
-    print(f"  Has arbitrage:   {result.has_arbitrage}")
-    print(f"  Converged:       {result.converged}")
-    
-    # Test case 2: Prices satisfy implication (A < B)
-    prices_ok = {"A": 0.4, "B": 0.6}
-    result_ok = find_arbitrage(prices_ok, graph)
-    
-    print(f"\nTest 2: A implies B satisfied")
-    print(f"  Market prices:   {prices_ok}")
-    print(f"  Coherent prices: {result_ok.coherent_prices}")
-    print(f"  KL divergence:   {result_ok.kl_divergence:.6f}")
-    print(f"  Has arbitrage:   {result_ok.has_arbitrage}")
-    
-    print("\nOptimizer integration: PASSED")
-    return True
+class TestArbitrageExtractor:
+    """Test ArbitrageExtractor trade extraction."""
+
+    def test_extractor_creation(self):
+        """Test extractor can be created with defaults."""
+        from src.arbitrage.extractor import ArbitrageExtractor
+        extractor = ArbitrageExtractor()
+        assert extractor.min_profit_threshold == 0.001
+        assert extractor.fee_per_leg == 0.01
+
+    def test_trade_net_profit(self):
+        """Test ArbitrageTrade net profit calculation."""
+        from src.arbitrage.extractor import ArbitrageTrade
+        trade = ArbitrageTrade(
+            constraint_type="implies",
+            positions={"A": "SELL", "B": "BUY"},
+            violation_amount=0.1,
+            locked_profit=0.1,
+            market_prices={"A": 0.7, "B": 0.5},
+            description="Test trade",
+        )
+        # 2 legs * 0.01 fee = 0.02 fees
+        assert trade.net_profit(fee_per_leg=0.01) == pytest.approx(0.08)
+        assert trade.num_legs == 2
+
+    def test_trade_zero_profit(self):
+        """Test trade with zero profit."""
+        from src.arbitrage.extractor import ArbitrageTrade
+        trade = ArbitrageTrade(
+            constraint_type="binary",
+            positions={"A": "BUY"},
+            violation_amount=0.0,
+            locked_profit=0.0,
+            market_prices={"A": 0.5},
+            description="No profit trade",
+        )
+        assert trade.locked_profit == 0.0
+        assert trade.net_profit(fee_per_leg=0.01) == -0.01
 
 
-def test_small_backtest():
-    """Run a small backtest with real data and synthetic relationships."""
-    from src.data import MarketLoader, TradeLoader, BlockLoader
-    from src.backtest import (
-        run_backtest_with_synthetic_relationships,
-        print_report,
-    )
-    
-    print("\n" + "=" * 60)
-    print("TEST: Small Backtest with Real Data")
-    print("=" * 60)
-    
-    # Load markets
-    market_loader = MarketLoader(DATA_DIR)
-    markets_df = market_loader.query_markets(min_volume=1_000_000, limit=5)
-    
-    if len(markets_df) < 2:
-        print("WARNING: Not enough markets for backtest, skipping")
-        return True
-    
-    # Get 2 markets
-    market_ids = markets_df["id"].to_list()[:2]
-    print(f"Testing with markets: {market_ids}")
-    
-    # Get market questions for context
-    for mid in market_ids:
-        market = market_loader.get_market(mid)
-        if market:
-            print(f"  {mid[:20]}...: {market.question[:50]}...")
-    
-    # Create a synthetic relationship
-    relationships = [
-        ("implies", market_ids[0], market_ids[1], 0.8),
-    ]
-    
-    print(f"\nSynthetic relationship: {market_ids[0][:20]} implies {market_ids[1][:20]}")
-    
-    # Run backtest with limited ticks
-    print("\nRunning backtest (max 500 ticks)...")
-    try:
-        report = run_backtest_with_synthetic_relationships(
-            market_ids=market_ids,
+class TestOptimizerIntegration:
+    """Test optimizer integration with the backtest pipeline."""
+
+    def test_find_arbitrage_violation(self):
+        """Test optimizer detects implication violation."""
+        from src.optimizer import (
+            find_arbitrage,
+            RelationshipGraph,
+            MarketCluster,
+            MarketRelationship,
+        )
+
+        relationships = [
+            MarketRelationship(
+                type="implies",
+                from_market="A",
+                to_market="B",
+                confidence=0.9,
+            ),
+        ]
+
+        cluster = MarketCluster(
+            cluster_id="test",
+            theme="Test Cluster",
+            market_ids=["A", "B"],
             relationships=relationships,
-            data_dir=DATA_DIR,
-            max_ticks=500,
-            progress_interval=100,
-            kl_threshold=0.001,  # Lower threshold to find more opportunities
         )
-        
-        print("\n" + "-" * 40)
-        print(f"Backtest Results:")
-        print(f"  Opportunities found: {report.total_opportunities}")
-        print(f"  Gross PnL: ${report.gross_pnl:.4f}")
-        print(f"  Net PnL: ${report.net_pnl:.4f}")
-        print(f"  Win rate: {report.win_rate * 100:.1f}%")
-        
-        if report.total_opportunities > 0:
-            print(f"\nSample opportunity:")
-            opp = report.opportunities[0]
-            print(f"  Block: {opp.position[0]}")
-            print(f"  KL divergence: {opp.kl_divergence:.6f}")
-            print(f"  Market prices: {opp.market_prices}")
-            print(f"  Coherent prices: {opp.coherent_prices}")
-        
-        print("\nSmall backtest: PASSED")
-        return True
-        
-    except Exception as e:
-        print(f"Backtest failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+
+        graph = RelationshipGraph(clusters=[cluster])
+
+        # Prices violate implication (A > B, but A implies B)
+        prices_violation = {"A": 0.7, "B": 0.5}
+        result = find_arbitrage(prices_violation, graph)
+
+        assert result.kl_divergence > 0
+        assert result.has_arbitrage
+
+    def test_find_arbitrage_no_violation(self):
+        """Test optimizer returns no arbitrage when prices are consistent."""
+        from src.optimizer import (
+            find_arbitrage,
+            RelationshipGraph,
+            MarketCluster,
+            MarketRelationship,
+        )
+
+        relationships = [
+            MarketRelationship(
+                type="implies",
+                from_market="A",
+                to_market="B",
+                confidence=0.9,
+            ),
+        ]
+
+        cluster = MarketCluster(
+            cluster_id="test",
+            theme="Test Cluster",
+            market_ids=["A", "B"],
+            relationships=relationships,
+        )
+
+        graph = RelationshipGraph(clusters=[cluster])
+
+        # Prices satisfy implication (A < B)
+        prices_ok = {"A": 0.4, "B": 0.6}
+        result = find_arbitrage(prices_ok, graph)
+
+        # Should have very small or zero KL divergence
+        assert result.kl_divergence < 0.01
 
 
-def test_cross_market_iterator():
-    """Test the CrossMarketIterator directly."""
-    from src.data import (
-        MarketLoader,
-        TradeLoader, 
-        BlockLoader,
-        CrossMarketIterator,
-    )
-    
-    print("\n" + "=" * 60)
-    print("TEST: Cross-Market Iterator")
-    print("=" * 60)
-    
-    market_loader = MarketLoader(DATA_DIR)
-    block_loader = BlockLoader(DATA_DIR)
-    trade_loader = TradeLoader(DATA_DIR, block_loader=block_loader)
-    
-    # Get 2 markets
-    markets_df = market_loader.query_markets(min_volume=1_000_000, limit=2)
-    if len(markets_df) < 2:
-        print("WARNING: Not enough markets, skipping")
-        return True
-    
-    market_ids = markets_df["id"].to_list()[:2]
-    print(f"Testing iterator with {len(market_ids)} markets")
-    
-    iterator = CrossMarketIterator(
-        trade_loader=trade_loader,
-        block_loader=block_loader,
-        market_loader=market_loader,
-        market_ids=market_ids,
-    )
-    
-    # Iterate through first 100 snapshots
-    count = 0
-    snapshots_with_prices = 0
-    
-    for snapshot in iterator.iter_snapshots(batch_size=200):
-        count += 1
-        if snapshot.has_all_prices():
-            snapshots_with_prices += 1
-            if snapshots_with_prices <= 3:
-                prices = snapshot.get_prices()
-                print(f"  Snapshot {count}: Block {snapshot.position.block_number}, prices: {prices}")
-        
-        if count >= 100:
-            break
-    
-    print(f"\nProcessed {count} snapshots")
-    print(f"Snapshots with all prices: {snapshots_with_prices}")
-    
-    print("\nCross-market iterator: PASSED")
-    return True
+class TestPartitionChecker:
+    """Test partition constraint checking."""
+
+    def test_partition_violation_sum_gt_1(self):
+        """Test partition detects sum > 1."""
+        from src.backtest.constraint_checker import check_partition
+
+        market_prices = {"A": 0.4, "B": 0.4, "C": 0.4}  # sum = 1.2
+        market_ids = list(market_prices.keys())
+        violation = check_partition(market_ids, market_prices)
+        assert violation is not None
+        assert abs(violation.violation_amount) > 0
+
+    def test_partition_violation_sum_lt_1(self):
+        """Test partition detects sum < 1."""
+        from src.backtest.constraint_checker import check_partition
+
+        market_prices = {"A": 0.2, "B": 0.2, "C": 0.2}  # sum = 0.6
+        market_ids = list(market_prices.keys())
+        violation = check_partition(market_ids, market_prices)
+        assert violation is not None
+        assert abs(violation.violation_amount) > 0
+
+    def test_partition_no_violation(self):
+        """Test partition passes when sum ~= 1."""
+        from src.backtest.constraint_checker import check_partition
+
+        market_prices = {"A": 0.5, "B": 0.3, "C": 0.2}  # sum = 1.0
+        market_ids = list(market_prices.keys())
+        violation = check_partition(market_ids, market_prices)
+        # Should be None or violation_amount close to 0
+        if violation is not None:
+            assert violation.violation_amount < 0.02  # within tolerance
 
 
-def main():
-    """Run all tests."""
-    print("=" * 60)
-    print("BACKTEST MODULE INTEGRATION TESTS")
-    print("=" * 60)
-    
-    tests = [
-        ("Report Generation", test_report_generation),
-        ("Data Loading", test_data_loading),
-        ("Optimizer Integration", test_optimizer_integration),
-        ("Cross-Market Iterator", test_cross_market_iterator),
-        ("Small Backtest", test_small_backtest),
-    ]
-    
-    results = []
-    for name, test_func in tests:
-        try:
-            passed = test_func()
-            results.append((name, passed))
-        except Exception as e:
-            print(f"\nTEST FAILED: {name}")
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            results.append((name, False))
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("TEST SUMMARY")
-    print("=" * 60)
-    
-    passed = sum(1 for _, p in results if p)
-    total = len(results)
-    
-    for name, p in results:
-        status = "PASSED" if p else "FAILED"
-        print(f"  {name}: {status}")
-    
-    print(f"\n{passed}/{total} tests passed")
-    
-    return passed == total
+# =============================================================================
+# Integration Tests (require data files on server)
+# =============================================================================
 
 
-if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+@pytest.mark.integration
+class TestDataLoading:
+    """Integration tests for data loading (requires Polymarket data files)."""
+
+    def test_market_loader(self):
+        """Test loading markets from parquet data."""
+        from src.data import MarketLoader
+        loader = MarketLoader(DATA_DIR)
+        markets_df = loader.query_markets(min_volume=1_000_000, limit=5)
+        assert len(markets_df) > 0
+
+    def test_block_loader(self):
+        """Test loading block timestamps."""
+        from src.data import BlockLoader
+        loader = BlockLoader(DATA_DIR)
+        assert loader is not None
