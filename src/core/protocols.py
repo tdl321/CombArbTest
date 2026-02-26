@@ -251,7 +251,7 @@ class BacktestEvaluator(Protocol):
 
     Implementations:
         - SinglePointEvaluator: for instant-arb (current behavior)
-        - TimeSteppedSimulator: for held positions (rebalancing, stat arb)
+        - TimeSteppedSimulator: for held positions
     """
 
     def evaluate(

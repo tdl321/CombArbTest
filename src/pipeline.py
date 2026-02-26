@@ -7,8 +7,6 @@ with multiple strategies.
 Usage:
     pipeline = Pipeline(data_source=ParquetMarketSource(...))
     pipeline.add_strategy("partition_arb", StrategyConfig(...))
-    pipeline.add_strategy("rebalancing_arb", StrategyConfig(...))
-    pipeline.add_grouper(LLMSemanticGrouper())
     pipeline.add_grouper(ManualGrouper(tournaments))
 
     results = pipeline.run(

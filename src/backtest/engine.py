@@ -160,7 +160,7 @@ class SinglePointEvaluator:
 
 
 class TimeSteppedSimulator:
-    """Evaluator for held-position strategies (rebalancing, stat arb).
+    """Evaluator for held-position strategies.
 
     Steps through time at fixed intervals, manages open positions,
     computes mark-to-market P&L at each step.
