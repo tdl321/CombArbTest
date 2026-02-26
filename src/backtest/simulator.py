@@ -179,9 +179,9 @@ class WalkForwardSimulator:
 
                 clusters_checked += 1
 
-                # Convert to dict to avoid llm.schema vs optimizer.schema type conflict
+                # Types unified: llm.schema and optimizer.schema now share the same base
                 cluster_graph = RelationshipGraph(
-                    clusters=[cluster.model_dump()],
+                    clusters=[cluster],
                 )
 
                 opportunity = self._check_arbitrage(
@@ -313,9 +313,9 @@ class WalkForwardSimulator:
                 if not cluster.relationships and not getattr(cluster, "is_partition", False):
                     continue
 
-                # Convert to dict to avoid llm.schema vs optimizer.schema type conflict
+                # Types unified: llm.schema and optimizer.schema now share the same base
                 cluster_graph = RelationshipGraph(
-                    clusters=[cluster.model_dump()],
+                    clusters=[cluster],
                 )
 
                 signal = self._check_signal(

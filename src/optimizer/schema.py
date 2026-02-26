@@ -8,7 +8,6 @@ valid joint outcomes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Literal, Optional
 
 import numpy as np
@@ -115,53 +114,45 @@ class ConditionSpace:
         return self._market_ids
 
 
-class RelationshipType(str, Enum):
-    """Types of logical relationships between markets."""
+# Import shared types from canonical LLM schema to avoid duplication
+from src.llm.schema import (
+    RelationshipType,
+    MarketRelationship as _LLMMarketRelationship,
+    MarketCluster as _LLMMarketCluster,
+    RelationshipGraph as _LLMRelationshipGraph,
+)
 
-    IMPLIES = "implies"  # B=YES implies A=YES
-    MUTUALLY_EXCLUSIVE = "mutually_exclusive"  # At most one can be YES
-    EQUIVALENT = "equivalent"  # Same outcome
-    OPPOSITE = "opposite"  # Opposite outcomes
-    # Additional types for backward compatibility
-    AND = "and"
-    OR = "or"
-    PREREQUISITE = "prerequisite"
-    EXHAUSTIVE = "exhaustive"
-    INCOMPATIBLE = "incompatible"
+# Re-export for backward compatibility — but these are now the SAME types
+# as in src.llm.schema, eliminating the need for model_dump() workarounds.
 
 
-class MarketRelationship(BaseModel):
-    """A logical relationship between two markets."""
-
-    type: str  # Allow string for backward compatibility
-    from_market: str
-    to_market: str | None = None  # None for unary constraints
-    confidence: float = 1.0
-    reasoning: str | None = None  # Optional LLM explanation
-
-
-class MarketCluster(BaseModel):
-    """A cluster of related markets with their relationships."""
-
-    cluster_id: str
-    market_ids: list[str]
-    relationships: list[MarketRelationship] = Field(default_factory=list)
-    is_partition: bool = False  # If True, markets must sum to 1
-    theme: str | None = None  # Optional cluster description
-
-    @property
-    def size(self) -> int:
-        return len(self.market_ids)
+# MarketRelationship: use canonical definition from llm.schema
+class MarketRelationship(_LLMMarketRelationship):
+    """A logical relationship between two markets.
+    
+    Re-exported from src.llm.schema for backward compatibility.
+    Accepts str type field for flexibility.
+    """
+    type: str = "implies"  # Allow string for backward compatibility
+    confidence: float = 1.0  # Default confidence for optimizer usage
 
 
-class RelationshipGraph(BaseModel):
-    """Graph of market relationships."""
+class MarketCluster(_LLMMarketCluster):
+    """A cluster of related markets with their relationships.
+    
+    Re-exported from src.llm.schema for backward compatibility.
+    Relaxes theme to be optional.
+    """
+    theme: str | None = None  # Optional for optimizer usage
 
-    clusters: list[MarketCluster] = Field(default_factory=list)
-    model_used: str | None = None
-    total_markets: int = 0
-    total_relationships: int = 0
 
+class RelationshipGraph(_LLMRelationshipGraph):
+    """Graph of market relationships.
+    
+    Re-exported from src.llm.schema for backward compatibility.
+    Adds get_relationships() method used by optimizer internals.
+    """
+    
     def get_relationships(self, market_ids: list[str]) -> list[MarketRelationship]:
         """Get all relationships involving the given markets."""
         market_set = set(market_ids)
@@ -173,20 +164,6 @@ class RelationshipGraph(BaseModel):
                 ):
                     relationships.append(rel)
         return relationships
-
-    def get_all_relationships(self) -> list[MarketRelationship]:
-        """Get all relationships across all clusters."""
-        rels = []
-        for cluster in self.clusters:
-            rels.extend(cluster.relationships)
-        return rels
-
-    def get_all_market_ids(self) -> set[str]:
-        """Get all unique market IDs across clusters."""
-        ids = set()
-        for cluster in self.clusters:
-            ids.update(cluster.market_ids)
-        return ids
 
     @property
     def computed_relationships(self) -> int:
