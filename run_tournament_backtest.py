@@ -6,6 +6,7 @@ Standalone version that doesn't require the full backtest module.
 
 import sys
 sys.path.insert(0, "/root/combarbbot")
+from src.backtest.tournament import TournamentMarket, PartitionTick
 
 import argparse
 import logging
