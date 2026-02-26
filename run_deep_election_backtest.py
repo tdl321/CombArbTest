@@ -70,11 +70,11 @@ if report.opportunities:
     print(f'TOP 20 ARBITRAGE OPPORTUNITIES')
     print('='*70)
     
-    sorted_opps = sorted(report.opportunities, key=lambda x: x.kl_divergence, reverse=True)
+    sorted_opps = sorted(report.opportunities, key=lambda x: x.violation_magnitude, reverse=True)
     
     for i, opp in enumerate(sorted_opps[:20]):
         print(f'\n--- Opportunity {i+1} ---')
-        print(f'  KL Divergence: {opp.kl_divergence:.6f}')
+        print(f'  KL Divergence: {opp.violation_magnitude:.6f}')
         print(f'  Block: {opp.position[0] if opp.position else "N/A"}')
         print(f'  Gross: ${opp.theoretical_profit:.4f}')
         print(f'  Prices:')
