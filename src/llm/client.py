@@ -13,9 +13,7 @@ from typing import Any
 
 import httpx
 
-import sys
-sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
-from config import get_config, SecretString
+from ..config import get_config, SecretString
 
 logger = logging.getLogger(__name__)
 

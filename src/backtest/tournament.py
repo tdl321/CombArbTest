@@ -19,7 +19,7 @@ from src.llm import RelationshipGraph, MarketCluster, MarketRelationship
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DATA_DIR = "/root/prediction-market-analysis/data/polymarket"
+from src.config import DEFAULT_DATA_DIR
 
 
 @dataclass

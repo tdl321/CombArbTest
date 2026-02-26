@@ -14,7 +14,7 @@ from .report import generate_report, format_report
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DATA_DIR = "/root/prediction-market-analysis/data/polymarket"
+from src.config import DEFAULT_DATA_DIR
 
 
 def run_backtest(

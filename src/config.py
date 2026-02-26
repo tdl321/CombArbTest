@@ -7,6 +7,30 @@ import logging
 import os
 from pathlib import Path
 from functools import lru_cache
+# =============================================================================
+# Centralized Path Configuration
+# =============================================================================
+import os
+
+# Default data directory for Polymarket parquet files
+DEFAULT_DATA_DIR = os.environ.get(
+    "COMBARBBOT_DATA_DIR",
+    "/root/prediction-market-analysis/data/polymarket"
+)
+
+# Default DuckDB database path
+DEFAULT_DB_PATH = os.environ.get(
+    "COMBARBBOT_DB_PATH",
+    "/root/combarbbot/polymarket.db"
+)
+
+# Project root directory
+PROJECT_ROOT = os.environ.get(
+    "COMBARBBOT_ROOT",
+    "/root/combarbbot"
+)
+
+
 
 from dotenv import load_dotenv
 
