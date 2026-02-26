@@ -28,9 +28,11 @@ class ManualGrouper:
     and returns them as MarketGroup objects.
     """
 
-    grouping_type = GroupingType.MANUAL
-
-    def __init__(self, group_definitions: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        group_definitions: list[dict[str, Any]] | None = None,
+        grouping_type: GroupingType = GroupingType.PARTITION,
+    ):
         """Initialize with pre-defined group definitions.
 
         Args:
@@ -40,8 +42,11 @@ class ManualGrouper:
                 - market_ids: list[str]
                 - is_partition: bool (default True)
                 - constraints: list[dict] (optional)
+            grouping_type: What GroupingType to expose to the pipeline.
+                Defaults to PARTITION since manual groups are typically partitions.
         """
         self._definitions = group_definitions or []
+        self.grouping_type = grouping_type
 
     def group(
         self,
@@ -91,7 +96,7 @@ class ManualGrouper:
                 group_id=defn["group_id"],
                 name=defn.get("name", defn["group_id"]),
                 market_ids=group_ids,
-                group_type=GroupingType.MANUAL,
+                group_type=self.grouping_type,
                 constraints=constraints,
                 is_partition=is_partition,
                 metadata=defn.get("metadata", {}),
