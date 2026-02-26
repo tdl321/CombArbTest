@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from src.data import MarketLoader, TradeLoader, BlockLoader
+from src.data import MarketLoader, TradeLoader, BlockLoader, CategoryIndex
 from src.llm import MarketInfo, build_relationship_graph, RelationshipGraph, MarketCluster, MarketRelationship
 
 from .schema import BacktestConfig, BacktestReport
@@ -18,7 +18,7 @@ DEFAULT_DATA_DIR = "/root/prediction-market-analysis/data/polymarket"
 
 
 def run_backtest(
-    market_ids: list[str],
+    market_ids: list[str] | None = None,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     start_block: Optional[int] = None,
@@ -31,8 +31,52 @@ def run_backtest(
     max_ticks: Optional[int] = None,
     progress_interval: int = 1000,
     store_all_opportunities: bool = True,
+    category: str | None = None,
+    subcategory: str | None = None,
 ) -> BacktestReport:
-    """Run backtest pipeline."""
+    """Run backtest pipeline.
+
+    Markets can be specified by:
+    - market_ids: Explicit list of market IDs
+    - category: Fetch all markets in a category from DuckDB
+
+    Args:
+        market_ids: Explicit market IDs (mutually exclusive with category)
+        category: Category filter (e.g., "politics", "sports")
+        subcategory: Subcategory filter (requires category)
+        start_date: Optional start date filter
+        end_date: Optional end date filter
+        start_block: Optional start block filter
+        end_block: Optional end block filter
+        kl_threshold: KL divergence threshold for arbitrage detection
+        transaction_cost: Fee per leg of trade
+        data_dir: Path to data directory
+        relationship_graph: Pre-built relationship graph
+        use_llm: Whether to use LLM for relationship extraction
+        max_ticks: Maximum ticks to process
+        progress_interval: Log progress every N ticks
+        store_all_opportunities: Store all opportunities in report
+    """
+    # Validation
+    if market_ids is not None and category is not None:
+        raise ValueError("Specify market_ids OR category, not both")
+
+    if subcategory is not None and category is None:
+        raise ValueError("subcategory requires category")
+
+    # Resolve from category
+    if category is not None:
+        idx = CategoryIndex()
+        market_ids = idx.query_by_category(category, subcategory, limit=None)
+        idx.close()
+        if not market_ids:
+            raise ValueError(f"No markets found for category={category!r}")
+        logger.info("[BACKTEST] Resolved %d markets from category=%s",
+                    len(market_ids), category)
+
+    if not market_ids:
+        raise ValueError("Must specify market_ids or category")
+
     logger.info("[BACKTEST] Starting backtest with %d markets", len(market_ids))
     logger.info("[BACKTEST] Parameters: violation_threshold=%.4f, fee_per_leg=%.4f, llm_relationships=%s",
                 kl_threshold, transaction_cost, use_llm)
