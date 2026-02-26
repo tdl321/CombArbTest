@@ -223,6 +223,7 @@ def _contract_toward_centroid(
     mu: NDArray,
     epsilon: float,
     centroid: NDArray | None = None,
+    condition_space: ConditionSpace | None = None,
 ) -> NDArray:
     """Contract mu toward an interior point.
 
@@ -231,13 +232,24 @@ def _contract_toward_centroid(
     Args:
         mu: Current point
         epsilon: Contraction factor
-        centroid: Interior point to contract toward (defaults to 0.5)
+        centroid: Interior point to contract toward
+        condition_space: Used to build proper per-market uniform centroid
 
     Returns:
         Contracted point
     """
     if centroid is None:
-        centroid = np.ones_like(mu) * 0.5
+        if condition_space is not None:
+            # Build proper per-market uniform centroid: 1/N for N outcomes
+            centroid = np.zeros_like(mu)
+            for market_id in condition_space.market_ids:
+                indices = condition_space.get_condition_indices(market_id)
+                n_outcomes = len(indices)
+                for idx in indices:
+                    centroid[idx] = 1.0 / n_outcomes
+        else:
+            # Fallback: 0.5 works for binary markets only
+            centroid = np.ones_like(mu) * 0.5
 
     return (1 - epsilon) * mu + epsilon * centroid
 
@@ -368,25 +380,123 @@ def _convert_to_single_prices(
 def _marginal_to_legacy_result(
     result: MarginalArbitrageResult,
     market_prices_input: dict[str, float],
+    relationships: RelationshipGraph | None = None,
 ) -> ArbitrageResult:
-    """Convert MarginalArbitrageResult to legacy ArbitrageResult."""
+    """Convert MarginalArbitrageResult to legacy ArbitrageResult.
+    
+    Uses the relationship graph to generate properly typed constraint violations
+    so the ArbitrageExtractor can map them to executable trades.
+    """
     coherent_single = _convert_to_single_prices(result.coherent_market_prices)
 
-    # Check for constraint violations
     violations = []
-    for mid in market_prices_input:
-        if mid in coherent_single:
-            diff = abs(coherent_single[mid] - market_prices_input[mid])
-            if diff > 0.01:
-                violations.append(
-                    ConstraintViolation(
-                        constraint_type="price_adjustment",
-                        from_market=mid,
-                        to_market=None,
-                        violation_amount=diff,
-                        description=f"Price adjusted by {diff:.4f}",
+
+    if relationships:
+        # Generate violations from the relationship graph with correct types
+        for rel in relationships.get_all_relationships():
+            rel_type = rel.type.lower() if isinstance(rel.type, str) else rel.type.value
+
+            if rel_type in ("implies", "prerequisite"):
+                # Implication: from_market=YES implies to_market=YES
+                # Violation: P(from) > P(to)
+                if rel.from_market in market_prices_input and rel.to_market and rel.to_market in market_prices_input:
+                    p_from = market_prices_input[rel.from_market]
+                    p_to = market_prices_input[rel.to_market]
+                    if p_from > p_to + 0.001:
+                        violations.append(
+                            ConstraintViolation(
+                                constraint_type="implies",
+                                from_market=rel.from_market,
+                                to_market=rel.to_market,
+                                violation_amount=p_from - p_to,
+                                description=f"implies({rel.from_market}->{rel.to_market}): P(from)={p_from:.4f} > P(to)={p_to:.4f}",
+                            )
+                        )
+
+            elif rel_type in ("mutually_exclusive", "incompatible", "mutex"):
+                # Mutex: P(A) + P(B) <= 1
+                # Violation: P(A) + P(B) > 1
+                if rel.from_market in market_prices_input and rel.to_market and rel.to_market in market_prices_input:
+                    p_a = market_prices_input[rel.from_market]
+                    p_b = market_prices_input[rel.to_market]
+                    if p_a + p_b > 1.0 + 0.001:
+                        violations.append(
+                            ConstraintViolation(
+                                constraint_type="mutex",
+                                from_market=rel.from_market,
+                                to_market=rel.to_market,
+                                violation_amount=p_a + p_b - 1.0,
+                                description=f"mutex: P({rel.from_market})+P({rel.to_market})={p_a + p_b:.4f} > 1.0",
+                            )
+                        )
+
+            elif rel_type == "equivalent":
+                # Equivalent: P(A) = P(B)
+                # Violation: |P(A) - P(B)| > threshold
+                if rel.from_market in market_prices_input and rel.to_market and rel.to_market in market_prices_input:
+                    p_a = market_prices_input[rel.from_market]
+                    p_b = market_prices_input[rel.to_market]
+                    diff = abs(p_a - p_b)
+                    if diff > 0.001:
+                        # Treat as two-directional implication violation
+                        if p_a > p_b:
+                            violations.append(
+                                ConstraintViolation(
+                                    constraint_type="implies",
+                                    from_market=rel.from_market,
+                                    to_market=rel.to_market,
+                                    violation_amount=diff,
+                                    description=f"equivalent({rel.from_market}={rel.to_market}): P(A)={p_a:.4f} > P(B)={p_b:.4f}",
+                                )
+                            )
+                        else:
+                            violations.append(
+                                ConstraintViolation(
+                                    constraint_type="implies",
+                                    from_market=rel.to_market,
+                                    to_market=rel.from_market,
+                                    violation_amount=diff,
+                                    description=f"equivalent({rel.to_market}={rel.from_market}): P(B)={p_b:.4f} > P(A)={p_a:.4f}",
+                                )
+                            )
+
+            elif rel_type == "opposite":
+                # Opposite: P(A) + P(B) = 1
+                # Can violate in either direction
+                if rel.from_market in market_prices_input and rel.to_market and rel.to_market in market_prices_input:
+                    p_a = market_prices_input[rel.from_market]
+                    p_b = market_prices_input[rel.to_market]
+                    total = p_a + p_b
+                    if abs(total - 1.0) > 0.001:
+                        violations.append(
+                            ConstraintViolation(
+                                constraint_type="binary",
+                                from_market=rel.from_market,
+                                to_market=rel.to_market,
+                                violation_amount=abs(total - 1.0),
+                                description=f"opposite: P({rel.from_market})+P({rel.to_market})={total:.4f} != 1.0",
+                            )
+                        )
+
+            elif rel_type == "exhaustive":
+                # Exhaustive constraint handled at partition level, not pairwise
+                pass
+
+    else:
+        # Fallback: generate generic price_adjustment violations (old behavior)
+        for mid in market_prices_input:
+            if mid in coherent_single:
+                diff = abs(coherent_single[mid] - market_prices_input[mid])
+                if diff > 0.01:
+                    violations.append(
+                        ConstraintViolation(
+                            constraint_type="price_adjustment",
+                            from_market=mid,
+                            to_market=None,
+                            violation_amount=diff,
+                            description=f"Price adjusted by {diff:.4f}",
+                        )
                     )
-                )
 
     return ArbitrageResult(
         market_prices=market_prices_input,
@@ -432,8 +542,8 @@ def find_arbitrage(
         config=config,
     )
 
-    # Convert result back
-    return _marginal_to_legacy_result(marginal_result, market_prices)
+    # Convert result back, passing relationships for proper violation typing
+    return _marginal_to_legacy_result(marginal_result, market_prices, relationships)
 
 
 def find_arbitrage_simple(
