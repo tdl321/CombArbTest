@@ -4,7 +4,7 @@ This module provides standardized logging setup across all components.
 Each component uses a consistent prefix format: [PREFIX] message
 
 Prefixes by module:
-- [DATA] - Data loading operations (loader, price_series, tick_stream)
+- [DATA] - Data loading operations (loader, tick_stream)
 - [LLM] - LLM client operations
 - [CLUSTER] - Overall clustering pipeline
 - [STAGE1] - Stage 1: Semantic clustering
@@ -94,7 +94,6 @@ class PrefixLoggerAdapter(logging.LoggerAdapter):
 MODULE_PREFIXES = {
     "src.data": "DATA",
     "src.data.loader": "DATA",
-    "src.data.price_series": "DATA",
     "src.data.tick_stream": "DATA",
     "src.data.models": "DATA",
     "src.llm": "LLM",

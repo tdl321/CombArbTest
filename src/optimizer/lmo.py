@@ -14,8 +14,7 @@ from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
-import gurobipy as gp
-from gurobipy import GRB
+import highspy
 
 from .schema import (
     ConditionSpace,
@@ -226,7 +225,7 @@ class MarginalPolytopeLMO:
 
     Solves: min c^T z subject to z in Z (valid binary joint outcomes)
 
-    Uses Gurobi MILP solver with binary integrality constraints.
+    Uses HiGHS MILP solver with binary integrality constraints.
     """
 
     def __init__(self, constraints: MarginalConstraintMatrix):
@@ -241,7 +240,7 @@ class MarginalPolytopeLMO:
         self.b_ub = constraints.b_ub
 
     def solve(self, gradient: NDArray) -> tuple[NDArray, float]:
-        """Solve the LMO using Gurobi: find vertex minimizing gradient^T z.
+        """Solve the LMO using HiGHS: find vertex minimizing gradient^T z.
 
         Args:
             gradient: The gradient vector (objective coefficients)
@@ -250,31 +249,35 @@ class MarginalPolytopeLMO:
             Tuple of (vertex z, objective value gradient^T z)
         """
         try:
-            # Create model (suppress output)
-            model = gp.Model("LMO")
-            model.Params.OutputFlag = 0  # Silent
-            model.Params.TimeLimit = 10  # 10 second timeout
+            h = highspy.Highs()
+            h.silent()
 
-            # Binary variables: z_i ∈ {0, 1}
-            z = model.addMVar(self.n, vtype=GRB.BINARY, name="z")
+            # Add binary variables: z_i in {0, 1}
+            for i in range(self.n):
+                h.addVar(0.0, 1.0)
+                h.changeColCost(i, gradient[i])
+                h.changeColIntegrality(i, highspy.HighsVarType.kInteger)
 
-            # Objective: minimize gradient^T z
-            model.setObjective(gradient @ z, GRB.MINIMIZE)
+            # Add equality constraints: A_eq @ z = b_eq
+            for i in range(self.A_eq.shape[0]):
+                row = self.A_eq[i]
+                indices = np.where(row != 0)[0].tolist()
+                values = row[indices].tolist()
+                h.addRow(self.b_eq[i], self.b_eq[i], len(indices), indices, values)
 
-            # Equality constraints: A_eq @ z = b_eq
-            if self.A_eq.shape[0] > 0:
-                model.addMConstr(self.A_eq, z, "=", self.b_eq, name="eq")
-
-            # Inequality constraints: A_ub @ z <= b_ub
-            if self.A_ub.shape[0] > 0:
-                model.addMConstr(self.A_ub, z, "<", self.b_ub, name="ub")
+            # Add inequality constraints: A_ub @ z <= b_ub
+            for i in range(self.A_ub.shape[0]):
+                row = self.A_ub[i]
+                indices = np.where(row != 0)[0].tolist()
+                values = row[indices].tolist()
+                h.addRow(-highspy.kHighsInf, self.b_ub[i], len(indices), indices, values)
 
             # Solve
-            model.optimize()
+            h.run()
 
-            if model.Status == GRB.OPTIMAL:
-                z_sol = np.array(z.X)
-                obj = model.ObjVal
+            if h.getModelStatus() == highspy.HighsModelStatus.kOptimal:
+                z_sol = np.array(h.getSolution().col_value)
+                obj = h.getInfo().objective_function_value
                 self._cache_vertex(z_sol)
                 return z_sol, obj
             else:
@@ -282,8 +285,8 @@ class MarginalPolytopeLMO:
                 z_fallback = np.ones(self.n) / 2
                 return z_fallback, gradient @ z_fallback
 
-        except gp.GurobiError:
-            # License or other Gurobi error - fallback
+        except Exception:
+            # Solver error - fallback
             z_fallback = np.ones(self.n) / 2
             return z_fallback, gradient @ z_fallback
 

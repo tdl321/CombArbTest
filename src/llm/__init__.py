@@ -13,6 +13,7 @@ from .clustering import (
     cluster_markets,
     build_relationship_graph,
 )
+from .cache import RelationshipCache, get_cache
 
 __all__ = [
     "LLMClient",
@@ -26,4 +27,6 @@ __all__ = [
     "MarketClusterer",
     "cluster_markets",
     "build_relationship_graph",
+    "RelationshipCache",
+    "get_cache",
 ]

@@ -82,20 +82,35 @@ class CategoryIndex:
         return {r[0]: MarketCategory(market_id=r[0], category=r[1], 
                 subcategory=r[2], confidence=r[3] or 1.0) for r in results}
 
-    def query_by_category(self, category: CategoryType, subcategory: SubcategoryType | None = None,
-                         limit: int = 1000, offset: int = 0) -> list[str]:
+    def query_by_category(
+        self,
+        category: CategoryType,
+        subcategory: SubcategoryType | None = None,
+        limit: int | None = None,
+        offset: int = 0
+    ) -> list[str]:
+        """Query market IDs by category.
+
+        Args:
+            category: Category to filter by
+            subcategory: Optional subcategory filter
+            limit: Max results (None = unlimited)
+            offset: Skip first N results
+        """
+        query = "SELECT market_id FROM market_categories WHERE category = ?"
+        params: list = [category]
+
         if subcategory:
-            results = self.conn.execute(
-                "SELECT market_id FROM market_categories WHERE category = ? AND subcategory = ? "
-                "ORDER BY market_id LIMIT ? OFFSET ?",
-                [category, subcategory, limit, offset]
-            ).fetchall()
-        else:
-            results = self.conn.execute(
-                "SELECT market_id FROM market_categories WHERE category = ? "
-                "ORDER BY market_id LIMIT ? OFFSET ?",
-                [category, limit, offset]
-            ).fetchall()
+            query += " AND subcategory = ?"
+            params.append(subcategory)
+
+        query += " ORDER BY market_id"
+
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+        results = self.conn.execute(query, params).fetchall()
         return [r[0] for r in results]
 
     def count_by_category(self) -> dict[str, int]:

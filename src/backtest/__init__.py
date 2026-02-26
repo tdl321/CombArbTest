@@ -60,17 +60,9 @@ from .schema import (
 
 # -----------------------------------------------------------------------------
 # PnL Functions
-# DEPRECATION NOTE: calculate_theoretical_profit, calculate_kl_profit, and
-# calculate_opportunity_pnl are deprecated. Use ArbitrageExtractor instead.
-# See src/backtest/pnl.py module docstring for migration guide.
 # -----------------------------------------------------------------------------
 from .pnl import (
-    # Deprecated (use ArbitrageExtractor.extract_trades() instead)
-    calculate_theoretical_profit,  # DEPRECATED
-    calculate_kl_profit,           # DEPRECATED
     apply_transaction_costs,
-    calculate_opportunity_pnl,     # DEPRECATED
-    PnLTracker,                    # DEPRECATED (uses old schema)
     # New correct functions
     calculate_arbitrage_pnl,
     calculate_partition_pnl,
@@ -133,12 +125,8 @@ __all__ = [
     "ClusterPerformance",
     "SimulationState",
     
-    # PnL - Deprecated (kept for backward compatibility)
-    "calculate_theoretical_profit",  # DEPRECATED
-    "calculate_kl_profit",           # DEPRECATED
+    # PnL
     "apply_transaction_costs",
-    "calculate_opportunity_pnl",     # DEPRECATED
-    "PnLTracker",                    # DEPRECATED
     # PnL - New correct functions
     "calculate_arbitrage_pnl",
     "calculate_partition_pnl",
@@ -181,13 +169,4 @@ __all__ = [
     "run_backtest",
     "run_backtest_with_synthetic_relationships",
     "print_report",
-    # Schema (NEW)
-    "ArbitrageTrade",
-    "BacktestOutput",
-    # Report Generator (NEW)
-    "ArbitrageBacktestReport",
-    "generate_full_report",
-    "generate_report_text",
-    # Simulator (NEW)
-    "run_backtest_with_report",
 ]

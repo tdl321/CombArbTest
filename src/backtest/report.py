@@ -13,7 +13,7 @@ from .schema import (
     BacktestReport,
     ClusterPerformance,
 )
-from .pnl import PnLTracker
+# PnLTracker removed - was unused
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def generate_report(
     total_opportunities = len(opportunities)
     opportunities_per_hour = total_opportunities / duration_hours if duration_hours > 0 else 0
 
-    gross_pnl = sum(o.theoretical_profit for o in opportunities)
+    gross_pnl = sum(o.locked_profit for o in opportunities)
     net_pnl = sum(o.net_profit() for o in opportunities)
     transaction_costs = gross_pnl - net_pnl
 

@@ -756,18 +756,10 @@ class WalkForwardSimulator:
         
         return ArbitrageOpportunity(
             timestamp=snapshot.timestamp or datetime.now(),
-            position=(snapshot.position.block_number, snapshot.position.log_index),
+            block_number=snapshot.position.block_number,
             cluster_id=cluster.cluster_id,
-            market_prices=dict(violation.prices),
-            coherent_prices=violation.coherent_prices,
-            kl_divergence=locked_profit,  # For partition, violation amount serves as divergence
-            constraints_violated=[
-                "Partition constraint: sum P = {:.4f} (expected 1.0)".format(violation.total),
-                "Direction: {} by {:.4f}".format(violation.direction, locked_profit),
-            ],
-            theoretical_profit=locked_profit,
-            net_profit=net_profit,
-            trade_direction=positions,
+            trade=trade,
+            solver_result=None,
             detection_method="partition_v2",
         )
 

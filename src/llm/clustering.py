@@ -432,6 +432,220 @@ class MarketClusterer:
         return relationships
 
 
+    # =========================================================================
+    # UNIFIED SINGLE-STAGE METHODS (with cache)
+    # =========================================================================
+
+    def cluster_and_extract_unified(
+        self,
+        markets: list[MarketInfo],
+        cache: "RelationshipCache | None" = None,
+    ) -> RelationshipGraph:
+        if not markets:
+            logger.warning("[UNIFIED] No markets provided")
+            return RelationshipGraph(clusters=[])
+
+        market_ids = [m.id for m in markets]
+        
+        if cache is not None:
+            cached = cache.get(market_ids)
+            if cached is not None:
+                logger.info("[UNIFIED] Cache hit for %d markets", len(markets))
+                return cached
+
+        logger.info("[UNIFIED] Single-stage analysis for %d markets", len(markets))
+        start_time = time.time()
+
+        if len(markets) <= self.max_batch_size:
+            graph = self._unified_batch(markets)
+        else:
+            all_clusters = []
+            batch_num = 0
+            for i in range(0, len(markets), self.max_batch_size):
+                batch_num += 1
+                batch = markets[i:i + self.max_batch_size]
+                logger.info("[UNIFIED] Batch %d: %d markets", batch_num, len(batch))
+                batch_graph = self._unified_batch(batch)
+                all_clusters.extend(batch_graph.clusters)
+            
+            graph = RelationshipGraph(
+                clusters=all_clusters,
+                model_used=getattr(self.client, "model", "unknown"),
+            )
+
+        elapsed = time.time() - start_time
+        logger.info("[UNIFIED] Done: %d clusters, %d constraints in %.3fs",
+                    len(graph.clusters), graph.total_relationships, elapsed)
+
+        if cache is not None:
+            cache.set(market_ids, graph)
+
+        return graph
+
+    def _unified_batch(self, markets: list[MarketInfo]) -> RelationshipGraph:
+        markets_data = [
+            {"id": m.id, "question": m.question, "outcomes": m.outcomes}
+            for m in markets
+        ]
+
+        prompt = UNIFIED_USER.format(markets_json=json.dumps(markets_data, indent=2))
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat_json(
+                    prompt=prompt,
+                    system=UNIFIED_SYSTEM,
+                    temperature=self.temperature,
+                )
+                return self._parse_unified_response(response, markets)
+            except Exception as e:
+                logger.warning("[UNIFIED] Attempt %d failed: %s", attempt + 1, e)
+                if attempt == self.max_retries:
+                    logger.error("[UNIFIED] All attempts failed, using fallback")
+                    return self._fallback_unified(markets)
+
+        return self._fallback_unified(markets)
+
+    def _parse_unified_response(
+        self,
+        response: dict[str, Any],
+        markets: list[MarketInfo],
+    ) -> RelationshipGraph:
+        clusters = []
+        valid_ids = {m.id for m in markets}
+        seen_ids = set()
+
+        for c in response.get("clusters", []):
+            market_ids = [
+                mid for mid in c.get("market_ids", [])
+                if mid in valid_ids and mid not in seen_ids
+            ]
+            
+            if len(market_ids) < MIN_PARTITION_MARKETS:
+                continue
+                
+            seen_ids.update(market_ids)
+
+            relationships = []
+            for r in c.get("relationships", []):
+                rel_type = r.get("type", "")
+                if rel_type not in ("mutually_exclusive", "exhaustive"):
+                    continue
+                    
+                from_id = r.get("from_market")
+                to_id = r.get("to_market")
+                confidence = float(r.get("confidence", 0.9))
+                
+                if from_id not in valid_ids:
+                    continue
+                if to_id is not None and to_id not in valid_ids:
+                    continue
+                if confidence < self.min_confidence:
+                    continue
+                    
+                relationships.append(MarketRelationship(
+                    type=rel_type,
+                    from_market=from_id,
+                    to_market=to_id,
+                    confidence=confidence,
+                    reasoning=r.get("reasoning"),
+                ))
+
+            clusters.append(MarketCluster(
+                cluster_id=c.get("cluster_id", "unknown"),
+                theme=c.get("theme", "Unknown"),
+                market_ids=market_ids,
+                is_partition=c.get("is_partition", False),
+                relationships=relationships,
+            ))
+
+        return RelationshipGraph(
+            clusters=clusters,
+            model_used=getattr(self.client, "model", "unknown"),
+        )
+
+    def _fallback_unified(self, markets: list[MarketInfo]) -> RelationshipGraph:
+        logger.warning("[UNIFIED] Using fallback")
+        if len(markets) >= MIN_PARTITION_MARKETS:
+            return RelationshipGraph(
+                clusters=[
+                    MarketCluster(
+                        cluster_id="fallback-all",
+                        theme="All markets (fallback)",
+                        market_ids=[m.id for m in markets],
+                    )
+                ]
+            )
+        return RelationshipGraph(clusters=[])
+
+    def cluster_incremental(
+        self,
+        markets: list[MarketInfo],
+        previous_graph: RelationshipGraph | None = None,
+        cache: "RelationshipCache | None" = None,
+    ) -> RelationshipGraph:
+        current_ids = {m.id for m in markets}
+        market_map = {m.id: m for m in markets}
+
+        if previous_graph is None:
+            return self.cluster_and_extract_unified(markets, cache=cache)
+
+        prev_ids = previous_graph.get_all_market_ids()
+
+        added = current_ids - prev_ids
+        removed = prev_ids - current_ids
+
+        if not added and not removed:
+            logger.info("[INCREMENTAL] No market changes, returning previous graph")
+            return previous_graph
+
+        logger.info("[INCREMENTAL] Changes: +%d added, -%d removed", len(added), len(removed))
+
+        affected_cluster_ids = set()
+        for cluster in previous_graph.clusters:
+            cluster_ids = set(cluster.market_ids)
+            if cluster_ids & removed or cluster_ids & added:
+                affected_cluster_ids.add(cluster.cluster_id)
+                logger.debug("[INCREMENTAL] Affected cluster: %s", cluster.cluster_id)
+
+        if not affected_cluster_ids and not added:
+            return previous_graph
+
+        markets_to_analyze = set()
+        
+        for cluster in previous_graph.clusters:
+            if cluster.cluster_id in affected_cluster_ids:
+                for mid in cluster.market_ids:
+                    if mid in current_ids:
+                        markets_to_analyze.add(mid)
+        
+        markets_to_analyze.update(added)
+
+        if not markets_to_analyze:
+            unchanged = [c for c in previous_graph.clusters if c.cluster_id not in affected_cluster_ids]
+            return RelationshipGraph(
+                clusters=unchanged,
+                model_used=previous_graph.model_used,
+            )
+
+        affected_markets = [market_map[mid] for mid in markets_to_analyze if mid in market_map]
+        logger.info("[INCREMENTAL] Re-analyzing %d markets", len(affected_markets))
+
+        new_graph = self._unified_batch(affected_markets)
+
+        unchanged = [c for c in previous_graph.clusters if c.cluster_id not in affected_cluster_ids]
+        merged = RelationshipGraph(
+            clusters=unchanged + new_graph.clusters,
+            model_used=getattr(self.client, "model", "unknown"),
+        )
+
+        if cache is not None:
+            cache.set([m.id for m in markets], merged)
+
+        return merged
+
+
+
 def cluster_markets(markets: list[MarketInfo], client: LLMClient | None = None) -> list[MarketCluster]:
     """Cluster markets (Stage 1 only)."""
     logger.debug("[CLUSTER] cluster_markets called with %d markets", len(markets))
@@ -665,3 +879,52 @@ def extract_complex_constraints(
         clusters=[cluster],
         model_used=getattr(extractor.client, "model", "unknown"),
     )
+
+
+# =============================================================================
+# UNIFIED PROMPT (single-stage clustering + constraints)
+# =============================================================================
+
+UNIFIED_SYSTEM = """Analyze prediction markets in one pass:
+1. Group semantically related markets (3+ per group for partitions)
+2. Extract logical constraints (mutually_exclusive, implies, exhaustive)
+
+PARTITION REQUIREMENTS:
+- Must have 3 or more markets (NOT binary Yes/No markets)
+- Must be BOTH exhaustive AND mutually exclusive
+- Mathematical constraint: Σ P(outcomes) = 1 exactly
+
+Examples of Valid Partitions:
+- Election winners (3+ candidates)
+- Championship outcomes (3+ teams)
+- Score ranges (3+ buckets)
+
+Return JSON only."""
+
+UNIFIED_USER = """Group these prediction markets and extract partition constraints.
+
+IMPORTANT: Prioritize grouping markets that form PARTITIONS (3+ markets where
+exactly one outcome must occur, like election candidates or championship winners).
+
+Markets:
+{markets_json}
+
+Return JSON:
+{{
+    "clusters": [
+        {{
+            "cluster_id": "descriptive-slug",
+            "theme": "Description",
+            "market_ids": ["id1", "id2", "id3"],
+            "is_partition": true,
+            "relationships": [
+                {{"type": "mutually_exclusive", "from_market": "id1", "to_market": "id2", "confidence": 0.95}},
+                {{"type": "exhaustive", "from_market": "id1", "to_market": null, "confidence": 0.95, "reasoning": "These markets cover all possible outcomes"}}
+            ]
+        }}
+    ]
+}}
+
+For each cluster with 3+ markets, add:
+- mutually_exclusive relationships between all pairs (n*(n-1)/2 pairs)
+- One exhaustive relationship if the set covers all possibilities"""

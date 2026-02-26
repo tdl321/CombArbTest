@@ -46,18 +46,10 @@ class ArbitrageOpportunity(BaseModel):
             return ArbitrageTrade(**v)
         raise ValueError("Expected ArbitrageTrade or dict, got %s" % type(v))
     
-    # Legacy fields for backward compatibility (deprecated)
-    # These will be computed from trade
     @computed_field
     @property
     def locked_profit(self) -> float:
         """Guaranteed profit at settlement (before fees)."""
-        return self.trade.locked_profit
-    
-    @computed_field
-    @property
-    def theoretical_profit(self) -> float:
-        """DEPRECATED: Alias for locked_profit. Use locked_profit instead."""
         return self.trade.locked_profit
     
     def net_profit(self, fee_per_leg: float = 0.01) -> float:
@@ -68,12 +60,6 @@ class ArbitrageOpportunity(BaseModel):
     @property
     def positions(self) -> dict[str, str]:
         """Market positions (BUY/SELL)."""
-        return self.trade.positions
-    
-    @computed_field
-    @property
-    def trade_direction(self) -> dict[str, str]:
-        """Alias for positions (deprecated, use positions)."""
         return self.trade.positions
     
     @computed_field

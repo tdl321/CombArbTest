@@ -1,21 +1,10 @@
 """PnL Calculation Module (BT-03).
 
-Calculates theoretical profit from arbitrage opportunities.
+Calculates profit from arbitrage opportunities.
 
-DEPRECATION NOTICE:
-The following functions are deprecated and will be removed in a future version:
-- calculate_theoretical_profit() -> Use ArbitrageExtractor.extract_trades()
-- calculate_kl_profit() -> Use ArbitrageExtractor.extract_trades()
-- calculate_opportunity_pnl() -> Use ArbitrageExtractor.extract_trades()
-
-The old functions use an incorrect profit model (sum of price adjustments).
 The correct model uses violation magnitude as profit (ArbitrageExtractor).
 
-Migration Guide:
-    # OLD (deprecated)
-    gross, net, dirs = calculate_opportunity_pnl(market_prices, coherent_prices, kl)
-    
-    # NEW (correct)
+Usage:
     from src.arbitrage.extractor import ArbitrageExtractor
     extractor = ArbitrageExtractor(min_profit_threshold=0.001, fee_per_leg=0.01)
     trades = extractor.extract_trades(solver_result)
@@ -27,109 +16,9 @@ Migration Guide:
 """
 
 import logging
-import warnings
-from decimal import Decimal
 from typing import Optional
 
-from .schema import ArbitrageOpportunity
-
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# DEPRECATED: Old price-convergence model (incorrect)
-# ============================================================================
-
-def calculate_theoretical_profit(
-    market_prices: dict[str, float],
-    coherent_prices: dict[str, float],
-    kl_divergence: float,
-    stake_size: float = 1.0,
-) -> tuple[float, dict[str, str]]:
-    """Calculate theoretical profit from price divergence.
-    
-    .. deprecated::
-        This function uses an incorrect profit model (sum of |coherent - market|).
-        Use ArbitrageExtractor.extract_trades() instead, which calculates profit
-        as the violation magnitude (locked arbitrage profit).
-        
-    Migration:
-        from src.arbitrage.extractor import ArbitrageExtractor
-        extractor = ArbitrageExtractor()
-        trades = extractor.extract_trades(solver_result)
-        best_trade = max(trades, key=lambda t: t.locked_profit)
-        profit = best_trade.locked_profit
-        positions = best_trade.positions
-    """
-    warnings.warn(
-        "calculate_theoretical_profit is deprecated. "
-        "Use ArbitrageExtractor.extract_trades() for correct arbitrage profit calculation. "
-        "See module docstring for migration guide.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    
-    logger.warning(
-        "[PNL] DEPRECATED: calculate_theoretical_profit called with %d markets",
-        len(market_prices)
-    )
-    logger.debug(
-        "[PNL] Calculating theoretical profit: markets=%d, kl=%.4f, stake=%.2f",
-        len(market_prices),
-        kl_divergence,
-        stake_size
-    )
-
-    profit = 0.0
-    trade_directions: dict[str, str] = {}
-
-    for market_id in market_prices:
-        market_price = market_prices[market_id]
-        coherent_price = coherent_prices.get(market_id, market_price)
-
-        adjustment = coherent_price - market_price
-
-        if abs(adjustment) < 1e-6:
-            continue
-
-        if adjustment > 0:
-            trade_directions[market_id] = "BUY"
-            profit += adjustment * stake_size
-        else:
-            trade_directions[market_id] = "SELL"
-            profit += abs(adjustment) * stake_size
-
-    logger.debug(
-        "[PNL] Theoretical profit: %.6f from %d trades (DEPRECATED MODEL)",
-        profit,
-        len(trade_directions)
-    )
-    return profit, trade_directions
-
-
-def calculate_kl_profit(
-    market_prices: dict[str, float],
-    coherent_prices: dict[str, float],
-    kl_divergence: float,
-    stake_size: float = 1.0,
-) -> float:
-    """Alternative profit calculation based on KL divergence.
-    
-    .. deprecated::
-        This function uses KL divergence as a proxy for profit, which is incorrect.
-        Use ArbitrageExtractor.extract_trades() instead.
-    """
-    warnings.warn(
-        "calculate_kl_profit is deprecated. "
-        "Use ArbitrageExtractor.extract_trades() for correct arbitrage profit calculation.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    logger.warning(
-        "[PNL] DEPRECATED: calculate_kl_profit called with kl=%.4f",
-        kl_divergence
-    )
-    return kl_divergence * stake_size
 
 
 def apply_transaction_costs(
@@ -139,8 +28,7 @@ def apply_transaction_costs(
 ) -> float:
     """Apply transaction costs to gross profit.
     
-    Note: This function is still valid for applying costs to any gross profit.
-    However, consider using ArbitrageTrade.net_profit(fee_per_leg) which
+    Note: Consider using ArbitrageTrade.net_profit(fee_per_leg) which
     handles fees correctly for hedged arbitrage positions.
     """
     total_cost = num_trades * transaction_cost_rate
@@ -154,177 +42,6 @@ def apply_transaction_costs(
     )
     return net_profit
 
-
-def calculate_opportunity_pnl(
-    market_prices: dict[str, float],
-    coherent_prices: dict[str, float],
-    kl_divergence: float,
-    transaction_cost_rate: float = 0.015,
-    stake_size: float = 1.0,
-) -> tuple[float, float, dict[str, str]]:
-    """Calculate full PnL for an arbitrage opportunity.
-    
-    .. deprecated::
-        This function uses an incorrect profit model. The correct approach:
-        
-        from src.arbitrage.extractor import ArbitrageExtractor
-        extractor = ArbitrageExtractor(fee_per_leg=0.01)
-        trades = extractor.extract_trades(solver_result)
-        if trades:
-            best = max(trades, key=lambda t: t.locked_profit)
-            gross = best.locked_profit
-            net = best.net_profit(fee_per_leg=0.01)
-            positions = best.positions
-    """
-    warnings.warn(
-        "calculate_opportunity_pnl is deprecated. "
-        "Use ArbitrageExtractor.extract_trades() for correct arbitrage profit. "
-        "See module docstring for migration guide.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    
-    logger.warning(
-        "[PNL] DEPRECATED: calculate_opportunity_pnl called with %d markets, kl=%.4f",
-        len(market_prices),
-        kl_divergence
-    )
-    
-    # Suppress nested deprecation warning for backward compatibility
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        gross_profit, trade_directions = calculate_theoretical_profit(
-            market_prices=market_prices,
-            coherent_prices=coherent_prices,
-            kl_divergence=kl_divergence,
-            stake_size=stake_size,
-        )
-
-    num_trades = len(trade_directions)
-
-    net_profit = apply_transaction_costs(
-        gross_profit=gross_profit,
-        num_trades=num_trades,
-        transaction_cost_rate=transaction_cost_rate,
-    )
-
-    logger.debug(
-        "[PNL] Opportunity PnL (DEPRECATED): gross=%.4f, net=%.4f, trades=%d",
-        gross_profit,
-        net_profit,
-        num_trades
-    )
-
-    return gross_profit, net_profit, trade_directions
-
-
-class PnLTracker:
-    """Track cumulative PnL over a backtest.
-    
-    .. deprecated::
-        This class uses the old ArbitrageOpportunity schema with theoretical_profit.
-        When the schema is updated to use ArbitrageTrade, this class should be
-        updated to use trade.locked_profit and trade.net_profit() instead.
-    """
-
-    def __init__(self, transaction_cost_rate: float = 0.015):
-        warnings.warn(
-            "PnLTracker uses deprecated ArbitrageOpportunity.theoretical_profit. "
-            "Will be updated when schema migration is complete.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.transaction_cost_rate = transaction_cost_rate
-
-        self.gross_pnl = 0.0
-        self.net_pnl = 0.0
-        self.total_costs = 0.0
-        self.num_trades = 0
-
-        self.win_count = 0
-        self.loss_count = 0
-
-        self.peak_pnl = 0.0
-        self.max_drawdown = 0.0
-
-        self.returns: list[float] = []
-
-        logger.info(
-            "[PNL] PnLTracker initialized (DEPRECATED): tx_cost_rate=%.4f",
-            transaction_cost_rate
-        )
-
-    def record_opportunity(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> None:
-        """Record an arbitrage opportunity."""
-        self.gross_pnl += opportunity.theoretical_profit
-        self.net_pnl += opportunity.net_profit
-        self.total_costs += (opportunity.theoretical_profit - opportunity.net_profit)
-        self.num_trades += len(opportunity.trade_direction)
-
-        if opportunity.net_profit > 0:
-            self.win_count += 1
-        elif opportunity.net_profit < 0:
-            self.loss_count += 1
-
-        if self.net_pnl > self.peak_pnl:
-            self.peak_pnl = self.net_pnl
-
-        drawdown = self.peak_pnl - self.net_pnl
-        if drawdown > self.max_drawdown:
-            self.max_drawdown = drawdown
-
-        self.returns.append(opportunity.net_profit)
-
-        logger.debug(
-            "[PNL] Recorded: net=%.4f, cumulative=%.4f, drawdown=%.4f",
-            opportunity.net_profit,
-            self.net_pnl,
-            drawdown
-        )
-
-    @property
-    def win_rate(self) -> float:
-        """Calculate win rate."""
-        total = self.win_count + self.loss_count
-        return self.win_count / total if total > 0 else 0.0
-
-    @property
-    def avg_return(self) -> float:
-        """Calculate average return per opportunity."""
-        if not self.returns:
-            return 0.0
-        return sum(self.returns) / len(self.returns)
-
-    def get_summary(self) -> dict:
-        """Get summary statistics."""
-        summary = {
-            "gross_pnl": self.gross_pnl,
-            "net_pnl": self.net_pnl,
-            "total_costs": self.total_costs,
-            "num_trades": self.num_trades,
-            "win_count": self.win_count,
-            "loss_count": self.loss_count,
-            "win_rate": self.win_rate,
-            "max_drawdown": self.max_drawdown,
-            "avg_return": self.avg_return,
-        }
-        logger.info(
-            "[PNL] Summary: gross=%.4f, net=%.4f, win_rate=%.2f%%, max_dd=%.4f, trades=%d",
-            self.gross_pnl,
-            self.net_pnl,
-            self.win_rate * 100,
-            self.max_drawdown,
-            self.num_trades
-        )
-        return summary
-
-
-# ============================================================================
-# NEW: Correct arbitrage-based PnL calculation
-# ============================================================================
 
 def calculate_arbitrage_pnl(
     market_prices: dict[str, float],
@@ -348,7 +65,7 @@ def calculate_arbitrage_pnl(
         net_profit: Profit after fees  
         trade_directions: market_id -> BUY/SELL
     """
-    from ..arbitrage.extractor import ArbitrageExtractor, ArbitrageTrade
+    from ..arbitrage.extractor import ArbitrageExtractor
     from ..optimizer.schema import ArbitrageResult
     
     logger.debug(
@@ -359,7 +76,6 @@ def calculate_arbitrage_pnl(
     )
     
     # Build a minimal ArbitrageResult to use the extractor
-    # (In practice, you'd pass the full result)
     result = ArbitrageResult(
         market_prices=market_prices,
         coherent_prices=market_prices,  # Not used by extractor
@@ -401,7 +117,7 @@ def calculate_partition_pnl(
     outcome_prices: list[float],
     fee_per_leg: float = 0.01,
     stake_size: float = 1.0,
-) -> tuple[str | None, float, float]:
+) -> tuple[Optional[str], float, float]:
     """Simple partition arbitrage check.
     
     For a set of mutually exclusive, exhaustive outcomes:
