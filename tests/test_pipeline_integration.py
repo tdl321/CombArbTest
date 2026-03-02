@@ -1,8 +1,8 @@
 """Integration tests for the modular pipeline.
 
-Verifies that existing strategies work through the pipeline,
-strategy discovery works, results match the old path, the import
-graph is layered, and new strategies can be registered trivially.
+Verifies that the combinatorial_arb strategy works through the pipeline,
+strategy discovery works, results are correct, the import graph is layered,
+and new strategies can be registered trivially.
 """
 
 import importlib
@@ -14,6 +14,8 @@ from typing import Any, Iterator
 from unittest.mock import MagicMock
 
 from src.core.types import (
+    Constraint,
+    ConstraintType,
     DataRequirements,
     GroupingType,
     GroupSnapshot,
@@ -109,6 +111,42 @@ class MockMarketSource:
         pass
 
 
+# ── Mock Grouper ──
+
+class MockGrouper:
+    """Simple grouper for testing that creates groups from definitions."""
+
+    def __init__(
+        self,
+        group_definitions: list[dict[str, Any]],
+        grouping_type: GroupingType = GroupingType.SEMANTIC,
+    ):
+        self._definitions = group_definitions
+        self.grouping_type = grouping_type
+
+    def group(
+        self,
+        markets: list[MarketMeta],
+        data_source: MarketDataSource | None = None,
+    ) -> list[MarketGroup]:
+        available_ids = {m.id for m in markets}
+        groups = []
+        for defn in self._definitions:
+            group_ids = [mid for mid in defn["market_ids"] if mid in available_ids]
+            if len(group_ids) < 2:
+                continue
+            groups.append(MarketGroup(
+                group_id=defn["group_id"],
+                name=defn.get("name", defn["group_id"]),
+                market_ids=group_ids,
+                group_type=self.grouping_type,
+                constraints=defn.get("constraints", []),
+                is_partition=defn.get("is_partition", False),
+                metadata=defn.get("metadata", {}),
+            ))
+        return groups
+
+
 def _make_market(mid: str, question: str = "Test?") -> MarketMeta:
     return MarketMeta(
         id=mid, question=question, slug=mid, outcomes=["Yes", "No"],
@@ -116,7 +154,7 @@ def _make_market(mid: str, question: str = "Test?") -> MarketMeta:
     )
 
 
-def _make_partition_snapshots(
+def _make_snapshots(
     market_ids: list[str],
     prices_over_time: list[dict[str, float]],
     start: datetime | None = None,
@@ -138,7 +176,7 @@ def _make_partition_snapshots(
                 ),
             )
         snapshots.append(GroupSnapshot(
-            group_id="partition_test",
+            group_id="test_group",
             timestamp=ts,
             snapshots=market_snaps,
         ))
@@ -146,54 +184,18 @@ def _make_partition_snapshots(
     return snapshots
 
 
-# ── Test 1: partition_arb and combinatorial_arb work through the pipeline ──
+# ── Test 1: combinatorial_arb works through the pipeline ──
 
-class TestPipelineWithPartitionArb:
-    """Test pipeline with partition arbitrage strategy."""
-
-    def test_partition_arb_detects_violations(self):
-        """Pipeline should detect partition violations (sum != 1)."""
-        import src.strategies.partition_arb  # noqa: F401
-        from src.grouping.manual_grouper import ManualGrouper
-
-        markets = [_make_market("A"), _make_market("B"), _make_market("C")]
-
-        # Create snapshots where partition sum != 1
-        snapshots = _make_partition_snapshots(
-            ["A", "B", "C"],
-            [
-                {"A": 0.30, "B": 0.30, "C": 0.30},  # Sum=0.90 (underpriced!)
-                {"A": 0.33, "B": 0.33, "C": 0.33},  # Sum=0.99 (close to 1)
-                {"A": 0.40, "B": 0.35, "C": 0.35},  # Sum=1.10 (overpriced!)
-            ],
-        )
-
-        data_source = MockMarketSource(markets, snapshots)
-
-        pipeline = Pipeline(data_source=data_source)
-        pipeline.add_grouper(ManualGrouper([{
-            "group_id": "test_partition",
-            "name": "Test Partition",
-            "market_ids": ["A", "B", "C"],
-            "is_partition": True,
-        }]))
-        pipeline.add_strategy("partition_arb")
-
-        results = pipeline.run()
-
-        assert "partition_arb" in results
-        result = results["partition_arb"]
-        assert isinstance(result, BacktestResult)
-        assert result.total_opportunities >= 1
+class TestPipelineWithCombinatorialArb:
+    """Test pipeline with combinatorial arbitrage strategy."""
 
     def test_combinatorial_arb_runs_through_pipeline(self):
         """combinatorial_arb should run through the pipeline without error."""
         import src.strategies.combinatorial_arb  # noqa: F401
-        from src.grouping.manual_grouper import ManualGrouper
 
         markets = [_make_market("A"), _make_market("B"), _make_market("C")]
 
-        snapshots = _make_partition_snapshots(
+        snapshots = _make_snapshots(
             ["A", "B", "C"],
             [
                 {"A": 0.30, "B": 0.30, "C": 0.30},
@@ -204,11 +206,7 @@ class TestPipelineWithPartitionArb:
         data_source = MockMarketSource(markets, snapshots)
 
         pipeline = Pipeline(data_source=data_source)
-        # combinatorial_arb needs SEMANTIC grouping; ManualGrouper can be
-        # configured for that.  Use is_partition=False to avoid generating
-        # MUTUALLY_EXCLUSIVE constraints (those exercise a separate optimizer
-        # code path not under test here).
-        pipeline.add_grouper(ManualGrouper(
+        pipeline.add_grouper(MockGrouper(
             [{
                 "group_id": "test_semantic",
                 "name": "Test Semantic Group",
@@ -234,10 +232,10 @@ class TestPipelineWithPartitionArb:
 
     def test_pipeline_with_no_markets(self):
         """Pipeline with no markets should return empty results."""
-        import src.strategies.partition_arb  # noqa: F401
+        import src.strategies.combinatorial_arb  # noqa: F401
         data_source = MockMarketSource([], [])
         pipeline = Pipeline(data_source=data_source)
-        pipeline.add_strategy("partition_arb")
+        pipeline.add_strategy("combinatorial_arb")
         results = pipeline.run()
         assert results == {}
 
@@ -249,23 +247,19 @@ class TestStrategyRegistryDiscovery:
 
     def test_strategy_registry_discovery(self):
         """All registered strategies should be discoverable."""
-        import src.strategies.partition_arb  # noqa: F401
         import src.strategies.combinatorial_arb  # noqa: F401
         from src.strategies.registry import list_strategies
 
         strategies = list_strategies()
-        assert "partition_arb" in strategies
         assert "combinatorial_arb" in strategies
 
     def test_registry_get_strategy(self):
         """Registry should instantiate strategies by name."""
-        import src.strategies.partition_arb  # noqa: F401
         import src.strategies.combinatorial_arb  # noqa: F401
         from src.strategies.registry import get_strategy
 
-        for name in ("partition_arb", "combinatorial_arb"):
-            strategy = get_strategy(name)
-            assert strategy.name == name
+        strategy = get_strategy("combinatorial_arb")
+        assert strategy.name == "combinatorial_arb"
 
     def test_registry_unknown_strategy_raises(self):
         """Requesting an unregistered strategy should raise KeyError."""
@@ -274,66 +268,7 @@ class TestStrategyRegistryDiscovery:
             get_strategy("nonexistent_strategy")
 
 
-# ── Test 3: Pipeline results match old WalkForwardSimulator path ──
-
-class TestPipelineEquivalence:
-    """Pipeline should produce results identical to direct strategy execution."""
-
-    def test_partition_arb_pipeline_matches_direct(self):
-        """Results from the pipeline should match calling strategy.detect() directly."""
-        import src.strategies.partition_arb  # noqa: F401
-        from src.strategies.registry import get_strategy
-        from src.grouping.manual_grouper import ManualGrouper
-
-        markets = [_make_market("A"), _make_market("B"), _make_market("C")]
-
-        snapshots = _make_partition_snapshots(
-            ["A", "B", "C"],
-            [
-                {"A": 0.30, "B": 0.30, "C": 0.30},  # Sum=0.90
-                {"A": 0.40, "B": 0.35, "C": 0.35},  # Sum=1.10
-            ],
-        )
-
-        data_source = MockMarketSource(markets, snapshots)
-
-        # Path A: through the pipeline
-        pipeline = Pipeline(data_source=data_source)
-        group_def = {
-            "group_id": "equiv_test",
-            "name": "Equivalence Test",
-            "market_ids": ["A", "B", "C"],
-            "is_partition": True,
-        }
-        pipeline.add_grouper(ManualGrouper([group_def]))
-        pipeline.add_strategy("partition_arb")
-        pipeline_results = pipeline.run()
-
-        # Path B: direct strategy execution (simulating WalkForwardSimulator)
-        strategy = get_strategy("partition_arb")
-        grouper = ManualGrouper([group_def])
-        groups = grouper.group(markets, data_source)
-        assert len(groups) == 1
-        group = groups[0]
-
-        direct_opps = []
-        for gs in data_source.iter_snapshots(["A", "B", "C"]):
-            opps = strategy.detect(group, gs)
-            direct_opps.extend(opps)
-
-        # Both paths should find the same number of opportunities
-        pipeline_result = pipeline_results["partition_arb"]
-        assert pipeline_result.total_opportunities == len(direct_opps)
-
-        # Both paths should compute the same expected profits
-        pipeline_profits = sorted(o.expected_profit for o in pipeline_result.opportunities)
-        direct_profits = sorted(o.expected_profit for o in direct_opps)
-        assert len(pipeline_profits) == len(direct_profits)
-        for pp, dp in zip(pipeline_profits, direct_profits):
-            assert abs(pp - dp) < 1e-10
-
-
-# ── Test 4: Import graph is strictly layered ──
+# ── Test 3: Import graph is strictly layered ──
 
 class TestImportGraph:
     """Verify no forbidden cross-layer imports.
@@ -363,10 +298,8 @@ class TestImportGraph:
         # Strategies/grouping must not import pipeline or backtest
         ("src.strategies.registry", "src.pipeline"),
         ("src.strategies.registry", "src.backtest"),
-        ("src.strategies.partition_arb", "src.pipeline"),
-        ("src.strategies.partition_arb", "src.backtest"),
-        ("src.grouping.manual_grouper", "src.pipeline"),
-        ("src.grouping.manual_grouper", "src.backtest"),
+        ("src.strategies.combinatorial_arb", "src.pipeline"),
+        ("src.strategies.combinatorial_arb", "src.backtest"),
     ]
 
     def _get_imports(self, module_name: str) -> set[str]:
@@ -407,7 +340,7 @@ class TestImportGraph:
                 )
 
 
-# ── Test 5: New strategy can be registered with minimal code ──
+# ── Test 4: New strategy can be registered with minimal code ──
 
 class TestMinimalStrategyRegistration:
     """A new strategy can be registered with a trivial mock."""
@@ -430,7 +363,7 @@ class TestMinimalStrategyRegistration:
 
             @property
             def required_grouping(self):
-                return GroupingType.PARTITION
+                return GroupingType.SEMANTIC
 
             @property
             def data_requirements(self):
@@ -465,21 +398,19 @@ class TestMinimalStrategyRegistration:
         assert strategy.name == "dummy_test_strategy"
 
         # Verify it runs through the pipeline
-        from src.grouping.manual_grouper import ManualGrouper
-
         markets = [_make_market("X"), _make_market("Y")]
-        snapshots = _make_partition_snapshots(
+        snapshots = _make_snapshots(
             ["X", "Y"],
             [{"X": 0.60, "Y": 0.50}],
         )
         data_source = MockMarketSource(markets, snapshots)
 
         pipeline = Pipeline(data_source=data_source)
-        pipeline.add_grouper(ManualGrouper([{
+        pipeline.add_grouper(MockGrouper([{
             "group_id": "dummy_group",
             "name": "Dummy",
             "market_ids": ["X", "Y"],
-            "is_partition": True,
+            "is_partition": False,
         }]))
         pipeline.add_strategy("dummy_test_strategy")
         results = pipeline.run()

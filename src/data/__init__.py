@@ -21,6 +21,10 @@ from .tick_stream import (
 )
 from .category_index import CategoryIndex, MarketCategory
 
+# Live Polymarket API pipeline
+from .live_source import LiveMarketSource
+from .polymarket import DatasetBuilder, DatasetSpec, LiveDataset
+
 __all__ = [
     # Loaders
     "DataLoader",
@@ -43,4 +47,9 @@ __all__ = [
     "Trade",
     "BlockTimestamp",
     "MarketStatus",
+    # Live pipeline
+    "LiveMarketSource",
+    "DatasetSpec",
+    "DatasetBuilder",
+    "LiveDataset",
 ]

@@ -21,8 +21,8 @@ def register_strategy(name: str):
     """Decorator to register a strategy class.
 
     Usage:
-        @register_strategy("partition_arb")
-        class PartitionArbitrage:
+        @register_strategy("combinatorial_arb")
+        class CombinatorialArbitrage:
             ...
     """
     def decorator(cls):

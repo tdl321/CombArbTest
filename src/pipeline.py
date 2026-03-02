@@ -1,13 +1,12 @@
 """Pipeline orchestrator for the modular architecture.
 
-This replaces the monolithic runner scripts (run_backtest.py, etc.)
-and provides a clean top-level entry point for running backtests
-with multiple strategies.
+This replaces the monolithic runner scripts and provides a clean
+top-level entry point for running backtests with multiple strategies.
 
 Usage:
-    pipeline = Pipeline(data_source=ParquetMarketSource(...))
-    pipeline.add_strategy("partition_arb", StrategyConfig(...))
-    pipeline.add_grouper(ManualGrouper(tournaments))
+    pipeline = Pipeline(data_source=LiveMarketSource(...))
+    pipeline.add_strategy("combinatorial_arb", StrategyConfig(...))
+    pipeline.add_grouper(my_grouper)
 
     results = pipeline.run(
         market_ids=[...],

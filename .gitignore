@@ -31,3 +31,8 @@ Thumbs.db
 *.sqlite
 *.log
 .api_venv/
+*.db-wal
+*.db.wal
+.tmp/
+.planning/
+.pytest_cache/
