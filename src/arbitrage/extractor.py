@@ -4,8 +4,7 @@ Converts constraint violations into executable arbitrage trades.
 The key insight: profit comes from the VIOLATION MAGNITUDE, not price convergence.
 
 For each constraint type:
-- Partition (sum=1): Buy all if sum<1, sell all if sum>1
-- Binary (YES+NO=1): Same as partition
+- Binary (YES+NO=1): Buy all if sum<1, sell all if sum>1
 - Implies (A→B): If P(A)>P(B), sell A + buy B
 - Mutex (A+B≤1): If sum>1, sell both
 """
@@ -99,18 +98,6 @@ class ArbitrageExtractor:
                         self.min_profit_threshold
                     )
         
-        # Also check for partition-level arbitrage across all markets
-        partition_trade = self._check_partition_arbitrage(result.market_prices)
-        if partition_trade:
-            net = partition_trade.net_profit(self.fee_per_leg)
-            if net >= self.min_profit_threshold:
-                logger.debug(
-                    "[ARB] Partition trade found: locked=%.4f, net=%.4f",
-                    partition_trade.locked_profit,
-                    net
-                )
-                trades.append(partition_trade)
-        
         if trades:
             logger.info(
                 "[ARB] Extracted %d trades from %d violations, best_profit=%.4f",
@@ -141,8 +128,6 @@ class ArbitrageExtractor:
             return self._handle_implies_violation(violation, market_prices)
         elif "mutex" in ctype:
             return self._handle_mutex_violation(violation, market_prices)
-        elif "partition" in ctype or "exhaustive" in ctype:
-            return self._handle_partition_violation(violation, market_prices)
         else:
             logger.warning("[ARB] Unknown constraint type: %s", ctype)
             return None
@@ -325,58 +310,6 @@ class ArbitrageExtractor:
             market_prices={market_a: p_a, market_b: p_b},
             description="Mutex arb: sell both at %.4f, max payout 1.0" % total,
         )
-    
-    def _check_partition_arbitrage(
-        self,
-        market_prices: dict[str, float],
-    ) -> ArbitrageTrade | None:
-        """Check if all markets form a partition with sum ≠ 1.
-        
-        This is the classic "buy/sell the field" arbitrage.
-        """
-        if len(market_prices) < 2:
-            return None
-        
-        total = sum(market_prices.values())
-        
-        # Need meaningful deviation (not just floating point noise)
-        if abs(total - 1.0) < 0.001:
-            return None
-        
-        if total < 1.0:
-            profit = 1.0 - total
-            positions = {m: "BUY" for m in market_prices}
-            desc = "Partition arb: buy all at %.4f, receive 1.0" % total
-            direction = "underpriced"
-        else:
-            profit = total - 1.0
-            positions = {m: "SELL" for m in market_prices}
-            desc = "Partition arb: sell all at %.4f, pay 1.0" % total
-            direction = "overpriced"
-        
-        logger.debug(
-            "[ARB] Partition check: %d markets, sum=%.4f (%s), profit=%.4f",
-            len(market_prices), total, direction, profit
-        )
-        
-        return ArbitrageTrade(
-            constraint_type="partition",
-            positions=positions,
-            violation_amount=abs(total - 1.0),
-            locked_profit=profit,
-            market_prices=dict(market_prices),
-            description=desc,
-        )
-    
-    def _handle_partition_violation(
-        self,
-        violation: ConstraintViolation,
-        market_prices: dict[str, float],
-    ) -> ArbitrageTrade | None:
-        """Handle explicit partition constraint violation."""
-        # This would need the full list of markets in the partition
-        # For now, delegate to _check_partition_arbitrage
-        return None
 
 
 def extract_arbitrage_from_result(

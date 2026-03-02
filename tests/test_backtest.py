@@ -70,7 +70,7 @@ class TestReportGeneration:
         from src.backtest.report import generate_report
 
         opportunities = []
-        for i, (profit, constraint) in enumerate([(0.1, "implies"), (0.2, "partition"), (0.01, "implies")]):
+        for i, (profit, constraint) in enumerate([(0.1, "implies"), (0.2, "mutex"), (0.01, "implies")]):
             trade = ArbitrageTrade(
                 constraint_type=constraint,
                 positions={"A": "SELL", "B": "BUY"},
@@ -84,7 +84,7 @@ class TestReportGeneration:
                 block_number=18000000 + i * 1000,
                 cluster_id="test_cluster",
                 trade=trade,
-                detection_method=constraint,
+                detection_method="solver",
             )
             opportunities.append(opp)
 
@@ -108,19 +108,19 @@ class TestReportGeneration:
         from src.backtest.report import generate_report, format_report
 
         trade = ArbitrageTrade(
-            constraint_type="partition",
-            positions={"A": "BUY", "B": "BUY", "C": "BUY"},
+            constraint_type="implies",
+            positions={"A": "SELL", "B": "BUY"},
             violation_amount=0.05,
             locked_profit=0.05,
-            market_prices={"A": 0.3, "B": 0.3, "C": 0.35},
-            description="Test partition trade",
+            market_prices={"A": 0.55, "B": 0.50},
+            description="Test implies trade",
         )
         opp = ArbitrageOpportunity(
             timestamp=datetime(2024, 1, 1, 10, 0, 0),
             block_number=18000000,
             cluster_id="test_cluster",
             trade=trade,
-            detection_method="partition",
+            detection_method="solver",
         )
 
         report = generate_report(
@@ -130,7 +130,7 @@ class TestReportGeneration:
             markets_analyzed=3,
             clusters_found=1,
             cluster_themes={"test_cluster": "Test"},
-            cluster_market_ids={"test_cluster": ["A", "B", "C"]},
+            cluster_market_ids={"test_cluster": ["A", "B"]},
         )
 
         formatted = format_report(report)
@@ -248,41 +248,6 @@ class TestOptimizerIntegration:
 
         # Should have very small or zero KL divergence
         assert result.kl_divergence < 0.01
-
-
-class TestPartitionChecker:
-    """Test partition constraint checking."""
-
-    def test_partition_violation_sum_gt_1(self):
-        """Test partition detects sum > 1."""
-        from src.backtest.constraint_checker import check_partition
-
-        market_prices = {"A": 0.4, "B": 0.4, "C": 0.4}  # sum = 1.2
-        market_ids = list(market_prices.keys())
-        violation = check_partition(market_ids, market_prices)
-        assert violation is not None
-        assert abs(violation.violation_amount) > 0
-
-    def test_partition_violation_sum_lt_1(self):
-        """Test partition detects sum < 1."""
-        from src.backtest.constraint_checker import check_partition
-
-        market_prices = {"A": 0.2, "B": 0.2, "C": 0.2}  # sum = 0.6
-        market_ids = list(market_prices.keys())
-        violation = check_partition(market_ids, market_prices)
-        assert violation is not None
-        assert abs(violation.violation_amount) > 0
-
-    def test_partition_no_violation(self):
-        """Test partition passes when sum ~= 1."""
-        from src.backtest.constraint_checker import check_partition
-
-        market_prices = {"A": 0.5, "B": 0.3, "C": 0.2}  # sum = 1.0
-        market_ids = list(market_prices.keys())
-        violation = check_partition(market_ids, market_prices)
-        # Should be None or violation_amount close to 0
-        if violation is not None:
-            assert violation.violation_amount < 0.02  # within tolerance
 
 
 # =============================================================================

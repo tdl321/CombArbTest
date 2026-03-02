@@ -69,7 +69,7 @@ class TestBregmanAnalysis:
             timestamp=datetime.now(),
             cluster_id="cluster_001",
             markets=["Outcome A", "Outcome B"],
-            constraint_type="partition",
+            constraint_type="mutually_exclusive",
             market_prices={"Outcome A": 0.55, "Outcome B": 0.55},
             coherent_prices={"Outcome A": 0.50, "Outcome B": 0.50},
             edge_magnitude=0.05,
@@ -369,7 +369,7 @@ def test_plot_signal():
         timestamp=datetime.now(),
         cluster_id="test-cluster",
         markets=["A", "B", "C"],
-        constraint_type="partition",
+        constraint_type="mutually_exclusive",
         market_prices={"A": 0.40, "B": 0.35, "C": 0.35},  # sum=1.10
         coherent_prices={"A": 0.364, "B": 0.318, "C": 0.318},
         edge_magnitude=0.05,

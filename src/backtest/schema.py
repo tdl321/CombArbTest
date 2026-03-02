@@ -27,12 +27,12 @@ class ArbitrageOpportunity(BaseModel):
     timestamp: datetime
     block_number: int
     cluster_id: str
-    detection_method: str = "solver"  # "partition" or "solver"
+    detection_method: str = "solver"  # Detection method used
     
     # The actual arbitrage trade (contains positions, locked_profit, etc.)
     trade: ArbitrageTrade
     
-    # Solver output (for diagnostics) - Optional since partition doesn't use solver
+    # Solver output (for diagnostics)
     solver_result: Optional[ArbitrageResult] = None
     
     @field_validator('trade', mode='before')

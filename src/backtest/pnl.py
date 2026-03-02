@@ -113,62 +113,6 @@ def calculate_arbitrage_pnl(
     return gross_profit, net_profit, best_trade.positions
 
 
-def calculate_partition_pnl(
-    outcome_prices: list[float],
-    fee_per_leg: float = 0.01,
-    stake_size: float = 1.0,
-) -> tuple[Optional[str], float, float]:
-    """Simple partition arbitrage check.
-    
-    For a set of mutually exclusive, exhaustive outcomes:
-    - If sum < 1: BUY ALL -> profit = (1 - sum) per unit
-    - If sum > 1: SELL ALL -> profit = (sum - 1) per unit
-    
-    Args:
-        outcome_prices: List of outcome prices
-        fee_per_leg: Transaction fee per leg
-        stake_size: Size of position
-        
-    Returns:
-        direction: "BUY_ALL", "SELL_ALL", or None
-        gross_profit: Before fees
-        net_profit: After fees
-    """
-    total = sum(outcome_prices)
-    num_legs = len(outcome_prices)
-    total_fees = num_legs * fee_per_leg
-    
-    logger.debug(
-        "[PNL] Partition check: %d outcomes, sum=%.4f, fees=%.4f",
-        num_legs,
-        total,
-        total_fees
-    )
-    
-    if total < 1.0 - total_fees:
-        gross = (1.0 - total) * stake_size
-        net = gross - (total_fees * stake_size)
-        logger.debug(
-            "[PNL] Partition arb: BUY_ALL, gross=%.4f, net=%.4f",
-            gross,
-            net
-        )
-        return "BUY_ALL", gross, net
-    
-    elif total > 1.0 + total_fees:
-        gross = (total - 1.0) * stake_size
-        net = gross - (total_fees * stake_size)
-        logger.debug(
-            "[PNL] Partition arb: SELL_ALL, gross=%.4f, net=%.4f",
-            gross,
-            net
-        )
-        return "SELL_ALL", gross, net
-    
-    logger.debug("[PNL] No partition arbitrage: sum=%.4f within fee buffer", total)
-    return None, 0.0, 0.0
-
-
 def calculate_implies_pnl(
     p_from: float,  # P(A) - the implying event
     p_to: float,    # P(B) - the implied event (A -> B)
