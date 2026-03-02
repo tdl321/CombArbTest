@@ -41,6 +41,47 @@ class MarginalConstraintMatrix:
     condition_space: ConditionSpace
 
 
+
+
+def enumerate_vertices_combinatorial(constraints: MarginalConstraintMatrix) -> list[NDArray]:
+    """Enumerate all feasible vertices by checking all combinations of market outcomes.
+
+    For N binary markets, there are 2^N possible joint outcomes.
+    Each candidate is checked against inequality constraints.
+    Equality constraints (exactly one outcome per market) are satisfied by construction.
+
+    For 10 markets = 1024 candidates, 20 markets = ~1M candidates.
+    """
+    space = constraints.condition_space
+    n_markets = space.n_markets()
+    n = space.n_conditions()
+    outcomes_per_market = [len(space.get_condition_indices(mid)) for mid in space.market_ids]
+
+    total_combos = 1
+    for o in outcomes_per_market:
+        total_combos *= o
+
+    vertices = []
+    for combo in range(total_combos):
+        z = np.zeros(n)
+        remainder = combo
+        for m_idx, mid in enumerate(space.market_ids):
+            n_outcomes = outcomes_per_market[m_idx]
+            choice = remainder % n_outcomes
+            remainder //= n_outcomes
+            indices = space.get_condition_indices(mid)
+            z[indices[choice]] = 1.0
+
+        # Check inequality constraints: A_ub @ z <= b_ub
+        if constraints.A_ub.shape[0] > 0:
+            if np.all(constraints.A_ub @ z <= constraints.b_ub + 1e-10):
+                vertices.append(z)
+        else:
+            vertices.append(z)
+
+    return vertices
+
+
 class MarginalConstraintBuilder:
     """Builder for marginal polytope constraints.
 
@@ -279,8 +320,23 @@ class MarginalPolytopeLMO:
         self.A_ub = constraints.A_ub
         self.b_ub = constraints.b_ub
 
+        # Pre-enumerate vertices combinatorially for small problems
+        n_markets = constraints.condition_space.n_markets()
+        if n_markets <= 20:
+            verts = enumerate_vertices_combinatorial(constraints)
+            if verts:
+                # Store as 2D array for fast vectorized linear scan
+                self._vertex_table = np.array(verts)  # shape (V, n)
+            else:
+                self._vertex_table = None
+        else:
+            self._vertex_table = None
+
     def solve(self, gradient: NDArray) -> tuple[NDArray, float]:
-        """Solve the LMO using HiGHS: find vertex minimizing gradient^T z.
+        """Solve the LMO: find vertex minimizing gradient^T z.
+
+        Uses pre-computed vertex table (linear scan) when available,
+        falls back to HiGHS MILP for large problems.
 
         Args:
             gradient: The gradient vector (objective coefficients)
@@ -288,6 +344,18 @@ class MarginalPolytopeLMO:
         Returns:
             Tuple of (vertex z, objective value gradient^T z)
         """
+        # Fast path: linear scan over pre-enumerated vertices
+        if self._vertex_table is not None:
+            objectives = self._vertex_table @ gradient  # shape (V,)
+            best_idx = np.argmin(objectives)
+            z = self._vertex_table[best_idx]
+            return z.copy(), objectives[best_idx]
+
+        # Slow path: HiGHS MILP (for n_markets > 20)
+        return self._solve_highs(gradient)
+
+    def _solve_highs(self, gradient: NDArray) -> tuple[NDArray, float]:
+        """Solve via HiGHS MILP. Fallback for large problems."""
         try:
             h = highspy.Highs()
             h.silent()
@@ -377,20 +445,25 @@ class MarginalPolytopeLMO:
         return list(self._vertices)
 
     def compute_centroid(self, n_samples: int = 20) -> NDArray:
-        """Compute approximate centroid of the polytope.
+        """Compute centroid of the polytope.
 
-        Uses vertex enumeration and averages.
+        Uses exact mean of all vertices when vertex table is available,
+        falls back to random gradient sampling otherwise.
 
         Args:
-            n_samples: Number of random gradient samples
+            n_samples: Number of random gradient samples (only used in fallback)
 
         Returns:
             Centroid vector (interior point)
         """
+        # Exact centroid from vertex table
+        if self._vertex_table is not None and len(self._vertex_table) > 0:
+            return np.mean(self._vertex_table, axis=0)
+
+        # Fallback: approximate via random gradients
         vertices = self.enumerate_vertices(max_vertices=n_samples)
 
         if not vertices:
-            # Fallback: uniform
             return np.ones(self.n) / 2
 
         centroid = np.mean(vertices, axis=0)
