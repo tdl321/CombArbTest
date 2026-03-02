@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from .client import LLMClient, get_client
+from .prompts import detect_competition, get_competition_prompt, compose_system_prompt
 from .schema import (
     MarketCluster,
     MarketInfo,
@@ -755,11 +756,18 @@ class ComplexConstraintExtractor:
         self,
         markets: list[MarketInfo],
         theme: str = "Related markets",
+        competition: str | None = None,
     ) -> list[MarketRelationship]:
         """Extract complex logical constraints from a set of markets.
         
         Returns constraints that require the solver (implies, prerequisite, etc.),
         NOT partition constraints (which can be checked algebraically).
+        
+        Args:
+            markets: Markets to analyze.
+            theme: Descriptive theme for the market group.
+            competition: Competition slug (e.g. "f1", "nfl"). If None,
+                auto-detects from market questions and theme.
         """
         if len(markets) < 2:
             logger.debug("[COMPLEX] Need at least 2 markets for constraints")
@@ -773,6 +781,20 @@ class ComplexConstraintExtractor:
             for m in markets
         ]
 
+        # Resolve competition-specific prompt
+        comp_prompt = None
+        if competition:
+            comp_prompt = get_competition_prompt(competition)
+        if comp_prompt is None:
+            comp_prompt = detect_competition(markets=markets_data, theme=theme)
+
+        if comp_prompt:
+            system_prompt = compose_system_prompt(comp_prompt)
+            logger.info("[COMPLEX] Using %s domain prompt", comp_prompt.display_name)
+        else:
+            system_prompt = COMPLEX_CONSTRAINTS_SYSTEM
+            logger.info("[COMPLEX] Using generic prompt (no competition detected)")
+
         prompt = COMPLEX_CONSTRAINTS_USER.format(
             theme=theme,
             markets_json=json.dumps(markets_data, indent=2),
@@ -782,7 +804,7 @@ class ComplexConstraintExtractor:
             try:
                 response = self.client.chat_json(
                     prompt=prompt,
-                    system=COMPLEX_CONSTRAINTS_SYSTEM,
+                    system=system_prompt,
                     temperature=self.temperature,
                 )
                 constraints = self._parse_complex_constraints(response, [m.id for m in markets])
@@ -850,16 +872,23 @@ def extract_complex_constraints(
     markets: list[MarketInfo],
     theme: str = "Related markets",
     client: LLMClient | None = None,
+    competition: str | None = None,
 ) -> RelationshipGraph:
     """Extract complex logical constraints and build a RelationshipGraph.
     
     This is the main entry point for complex constraint extraction.
     Returns a graph with is_partition=False clusters that require solver evaluation.
+    
+    Args:
+        markets: Markets to analyze.
+        theme: Descriptive theme for the market group.
+        client: Optional LLM client override.
+        competition: Competition slug (e.g. "f1", "nfl"). Auto-detects if None.
     """
     logger.info("[COMPLEX] extract_complex_constraints called with %d markets", len(markets))
 
     extractor = ComplexConstraintExtractor(client=client)
-    constraints = extractor.extract_constraints(markets, theme)
+    constraints = extractor.extract_constraints(markets, theme, competition=competition)
 
     if not constraints:
         logger.warning("[COMPLEX] No complex constraints found")

@@ -322,6 +322,7 @@ def main() -> int:
         cross_constraints = extractor.extract_constraints(
             markets=market_infos,
             theme="F1 2026 Championship: drivers and constructors relationships",
+            competition="f1",
         )
     except Exception as e:
         print(f"  ERROR from LLM: {e}")
